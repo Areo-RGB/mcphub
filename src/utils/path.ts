@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { dirname } from 'path';
 import { getCurrentModuleDir } from './moduleDir.js';
+import { logger } from './logger.js';
 
 // Project root directory - use process.cwd() as a simpler alternative
 const rootDir = process.cwd();
@@ -125,8 +126,8 @@ export const findPackageRoot = (startPath?: string): string | null => {
   );
 
   if (debug) {
-    console.log('DEBUG: Searching for package.json from:', startPath || 'multiple locations');
-    console.log('DEBUG: Checking paths:', possibleRoots);
+    logger.log('DEBUG: Searching for package.json from:', startPath || 'multiple locations');
+    logger.log('DEBUG: Checking paths:', possibleRoots);
   }
 
   // Remove duplicates
@@ -139,7 +140,7 @@ export const findPackageRoot = (startPath?: string): string | null => {
         const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
         if (pkg.name === 'mcphub' || pkg.name === '@samanhappy/mcphub') {
           if (debug) {
-            console.log(`DEBUG: Found package.json at ${packageJsonPath}`);
+            logger.log(`DEBUG: Found package.json at ${packageJsonPath}`);
           }
           // Cache the result if no specific start path was requested
           if (!startPath) {
@@ -150,14 +151,14 @@ export const findPackageRoot = (startPath?: string): string | null => {
       } catch (e) {
         // Continue to the next potential root
         if (debug) {
-          console.error(`DEBUG: Failed to parse package.json at ${packageJsonPath}:`, e);
+          logger.error(`DEBUG: Failed to parse package.json at ${packageJsonPath}:`, e);
         }
       }
     }
   }
 
   if (debug) {
-    console.warn('DEBUG: Could not find package root directory');
+    logger.warn('DEBUG: Could not find package root directory');
   }
 
   // Cache null result as well to avoid repeated searches
@@ -168,11 +169,31 @@ export const findPackageRoot = (startPath?: string): string | null => {
   return null;
 };
 
-function getParentPath(p: string, filename: string): string {
-  if (p.endsWith(filename)) {
-    p = p.slice(0, -filename.length);
+function isExplicitDirectoryPath(p: string): boolean {
+  return /[/\\]$/.test(p);
+}
+
+function resolveSettingsPathFromEnv(envPath: string, filename: string): string {
+  const resolvedEnvPath = path.resolve(envPath);
+  let settingsPath: string;
+
+  if (fs.existsSync(resolvedEnvPath)) {
+    settingsPath = fs.statSync(resolvedEnvPath).isDirectory()
+      ? path.join(resolvedEnvPath, filename)
+      : resolvedEnvPath;
+  } else if (isExplicitDirectoryPath(envPath) || path.extname(path.basename(envPath)) === '') {
+    settingsPath = path.join(resolvedEnvPath, filename);
+  } else {
+    settingsPath = resolvedEnvPath;
   }
-  return path.resolve(p);
+
+  const dir = path.dirname(settingsPath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+    logger.log(`Created directory for settings at ${dir}`);
+  }
+
+  return settingsPath;
 }
 
 /**
@@ -185,20 +206,7 @@ export const getConfigFilePath = (filename: string, description = 'Configuration
   if (filename === 'mcp_settings.json') {
     const envPath = process.env.MCPHUB_SETTING_PATH;
     if (envPath) {
-      // Ensure directory exists
-      const dir = getParentPath(envPath, filename);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-        console.log(`Created directory for settings at ${dir}`);
-      }
-
-      // if full path, return as is
-      if (envPath?.endsWith(filename)) {
-        return envPath;
-      }
-
-      // if directory, return path under that directory
-      return path.resolve(envPath, filename);
+      return resolveSettingsPathFromEnv(envPath, filename);
     }
   }
 
@@ -228,7 +236,7 @@ export const getConfigFilePath = (filename: string, description = 'Configuration
   if (packageRoot) {
     const packageConfigPath = path.join(packageRoot, filename);
     if (fs.existsSync(packageConfigPath)) {
-      console.log(`Using ${description} from package: ${packageConfigPath}`);
+      logger.log(`Using ${description} from package: ${packageConfigPath}`);
       return packageConfigPath;
     }
   }
@@ -238,7 +246,7 @@ export const getConfigFilePath = (filename: string, description = 'Configuration
   // even if the configuration file is missing. This fallback is particularly useful in
   // development environments or when the file is optional.
   const defaultPath = path.resolve(process.cwd(), filename);
-  console.debug(
+  logger.debug(
     `${description} file not found at any expected location, using default path: ${defaultPath}`,
   );
   return defaultPath;

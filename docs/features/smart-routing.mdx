@@ -71,7 +71,7 @@ Smart Routing requires additional setup compared to basic MCPHub usage:
         environment:
           - DB_URL=postgresql://mcphub:password@postgres:5432/mcphub
           - OPENAI_API_KEY=your_openai_api_key
-          - ENABLE_SMART_ROUTING=true
+          - SMART_ROUTING_ENABLED=true
         depends_on:
           - postgres
         volumes:
@@ -109,14 +109,14 @@ Smart Routing requires additional setup compared to basic MCPHub usage:
       -e POSTGRES_USER=mcphub \
       -e POSTGRES_PASSWORD=your_password \
       -p 5432:5432 \
-      pgvector/pgvector:pg16
+      pgvector/pgvector:pg17
     ```
 
     2. **Set Environment Variables**:
     ```bash
     export DB_URL="postgresql://mcphub:your_password@localhost:5432/mcphub"
     export OPENAI_API_KEY="your_openai_api_key"
-    export ENABLE_SMART_ROUTING="true"
+    export SMART_ROUTING_ENABLED="true"
     ```
 
     3. **Start MCPHub**:
@@ -185,7 +185,7 @@ Smart Routing requires additional setup compared to basic MCPHub usage:
                 secretKeyRef:
                   name: openai-secret
                   key: api-key
-            - name: ENABLE_SMART_ROUTING
+            - name: SMART_ROUTING_ENABLED
               value: "true"
             ports:
             - containerPort: 3000
@@ -206,12 +206,13 @@ DB_URL=postgresql://user:password@host:5432/database
 OPENAI_API_KEY=your_openai_api_key
 
 # Optional
-ENABLE_SMART_ROUTING=true
+SMART_ROUTING_ENABLED=true
 EMBEDDING_MODEL=text-embedding-3-small
-SIMILARITY_THRESHOLD=0.7
-MAX_TOOLS_RETURNED=10
-EMBEDDING_BATCH_SIZE=100
 ```
+
+Every Smart Routing setting above takes precedence over the matching field in the dashboard: resolution order is **environment variable → dashboard setting → built-in default**. A leftover variable in `.env` therefore wins over a value you save in the UI, which is a silent failure mode rather than an error — the dashboard shows the value you typed while the runtime keeps using the env var (issue #642). Affected fields now carry a warning naming the variable that is actually in use.
+
+The same order applies to the `Enabled` toggle and `DB URL`, but the dashboard reflects those directly instead of warning: the toggle mirrors the env var, and the URL field shows a `${DB_URL}` placeholder.
 
 ### Configuration Options
 
@@ -236,11 +237,20 @@ EMBEDDING_BATCH_SIZE=100
     # OpenAI (default)
     OPENAI_API_KEY=sk-your-api-key
     EMBEDDING_MODEL=text-embedding-3-small
+    # Optional provider-supported output dimension (for example: 768)
+    EMBEDDING_DIMENSIONS=768
+
+    # Only models known to support Matryoshka (MRL) receive the `dimensions`
+    # parameter automatically (text-embedding-3-*, gemini-embedding-*).
+    # Non-MRL models/backends (Qwen3-Embedding, BGE, vLLM/sglang) reject the
+    # parameter outright (issue #1131). Force forwarding for other MRL-capable
+    # models with:
+    # EMBEDDING_DIMENSIONS_API_PASSTHROUGH=true
 
     # Azure OpenAI
     AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
     AZURE_OPENAI_API_KEY=your-api-key
-    AZURE_OPENAI_DEPLOYMENT=your-embedding-deployment
+    AZURE_OPENAI_EMBEDDING_DEPLOYMENT=your-embedding-deployment
     # The actual OpenAI model name behind the deployment (for accurate token counting)
     AZURE_OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 
@@ -297,6 +307,8 @@ EMBEDDING_BATCH_SIZE=100
     OPENAI_API_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
     OPENAI_API_KEY=your-google-ai-studio-api-key
     EMBEDDING_MODEL=gemini-embedding-001
+    # Optional: 128, 256, 512, 768, 1536, 2048, or 3072
+    EMBEDDING_DIMENSIONS=768
     ```
 
     <Tip>
@@ -304,12 +316,28 @@ EMBEDDING_BATCH_SIZE=100
 
       `gemini-embedding-001` is available via Google's OpenAI-compatible endpoint at
       `https://generativelanguage.googleapis.com/v1beta/openai`.
-      It operates through the standard `openaiApiBaseUrl` setting — no additional
+      It operates through the standard `llmProviderBaseUrl` setting — no additional
       configuration is required beyond setting the base URL, API key, and model name.
       Google provides a generous **free tier of 100 RPM**, making it an excellent
       choice for self-hosted or low-traffic deployments.
     </Tip>
 
+  </Accordion>
+
+  <Accordion title="Embedding Task Prefixes">
+    Asymmetric retrieval models are trained with different task prefixes for queries and
+    documents, and score noticeably worse on raw text. Set the prefixes your model expects
+    in Settings → Smart Routing or via environment variables:
+
+    ```bash
+    # EmbeddingGemma
+    SMART_ROUTING_EMBEDDING_QUERY_PREFIX="task: search result | query: "
+    SMART_ROUTING_EMBEDDING_DOCUMENT_PREFIX="title: none | text: "
+    ```
+
+    Both are empty by default, which embeds raw text as before. Prefixes are used verbatim,
+    so keep the trailing space. Changing the document prefix re-embeds every server's tools;
+    changing the query prefix takes effect on the next search.
   </Accordion>
 
   <Accordion title="Search Parameters">
@@ -456,6 +484,16 @@ Progressive Disclosure is an optimization feature that reduces token usage when 
     ```bash
     SMART_ROUTING_PROGRESSIVE_DISCLOSURE=true
     ```
+  </Accordion>
+
+  <Accordion title="Including Server Descriptions in search_tools">
+    By default, `search_tools` lists only server names in its tool description. To include each server's description (or upstream instructions) alongside the name, set:
+
+    ```bash
+    SMART_ROUTING_SERVER_DESCRIPTION_MODE=full
+    ```
+
+    Use `names` (default) to keep the legacy compact list.
   </Accordion>
 
   <Accordion title="Standard Mode (Default)">
@@ -900,7 +938,11 @@ curl -X POST http://localhost:3000/api/smart-routing/feedback \
     3. Use more specific queries
     4. Check tool metadata quality
     ```bash
-    # Re-index all tools
+    # Re-index all tools (full rebuild: clears vector_embeddings first, then
+    # regenerates embeddings for every enabled server; servers that require
+    # personal credentials are reached through the users holding a binding,
+    # indexing the union of the tools those users can see; runs synchronously
+    # and streams per-server progress through SSE embedding-sync-progress events)
     curl -X POST http://localhost:3000/api/smart-routing/reindex \
       -H "Authorization: Bearer YOUR_JWT_TOKEN"
     ```
@@ -919,12 +961,35 @@ curl -X POST http://localhost:3000/api/smart-routing/feedback \
     3. Reduce batch sizes
     4. Monitor system resources
     ```bash
-    # Check system performance
+    # Check vector store status and performance (config, database connection,
+    # row counts, per-model/per-server breakdown, sync freshness, coverage)
     curl http://localhost:3000/api/smart-routing/performance \
       -H "Authorization: Bearer YOUR_JWT_TOKEN"
     ```
 
   </Accordion>
+
+  <Accordion title="Authentication Errors Despite a Valid Dashboard Key">
+    **Symptoms:**
+    - Tool indexing fails with an authentication (401/403) error
+    - A valid key is saved in the dashboard, yet requests keep being rejected
+
+    **Cause:** an environment variable outranks the dashboard value, so the key you saved is never used (issue #642). Recent versions show a warning under the affected field naming the variable in use.
+
+    **Solutions:**
+    1. Look for `OPENAI_API_KEY` / `AZURE_OPENAI_API_KEY` in `.env*` files, your shell profile, or the container/service definition
+    2. Remove the stale variable and restart, then re-index if the provider or model also changed
+    3. Confirm the key actually in use with a manual request:
+
+    ```bash
+    curl -X POST "${OPENAI_API_BASE_URL:-https://api.openai.com/v1}/embeddings" \
+      -H "Authorization: Bearer $OPENAI_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{"input": "test", "model": "text-embedding-3-small"}'
+    ```
+
+  </Accordion>
+
 </AccordionGroup>
 
 ## Best Practices

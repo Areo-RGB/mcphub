@@ -63,18 +63,61 @@ MCPHub uses several configuration files:
 
 ## Server Configuration Options
 
-### Required Fields
+A server entry has the shape `"<server-name>": ServerConfig`. The relevant fields depend on the transport, which is selected by `type`.
 
-| Field     | Type   | Description                |
-| --------- | ------ | -------------------------- |
-| `command` | string | Executable command or path |
-| `args`    | array  | Command-line arguments     |
+### Top-level fields
 
-### Optional Fields
+| Field | Type | Required | Description |
+| ----- | ---- | -------- | ----------- |
+| `type` | `"stdio" \| "sse" \| "streamable-http" \| "openapi"` | Recommended | Transport. Defaults to `stdio` when omitted but a `command` is provided. |
+| `enabled` | boolean | no | Defaults to `true`. Disabled servers stay in settings but are not connected. |
+| `owner` | string | no | Username that owns the entry. Defaults to the creating user or `admin`. Used for user-scoped routes (`/:user/mcp/...`). |
+| `visibility` | `"private" \| "group" \| "public"` | no | Runtime access for non-admin users. Defaults to `private`; `group` grants access to `sharedWithUsers`. |
+| `sharedWithUsers` | string[] | no | Local usernames allowed to discover and call a server whose `visibility` is `group`. Ignored for other visibility values. |
+| `description` | string | no | Free-form description displayed in the dashboard. |
+| `options` | object | no | Per-server runtime options (see `src/types/index.ts`). |
+| `proxy` | object | no | Optional HTTP proxy settings (`url`, `noProxy`, etc.). |
+| `oauth` | object | no | Upstream OAuth client settings (used when the upstream server requires OAuth). |
+| `enableKeepAlive` | boolean | no | For `sse` / `streamable-http`: enable periodic health checks and automatic reconnect attempts. |
+| `keepAliveInterval` | number | no | Health check and reconnect interval in milliseconds. Defaults to `60000`. |
+| `perSessionClient` | boolean | no | Create a dedicated upstream client per downstream MCP session instead of sharing one connection across all sessions. Use for stateful servers like Playwright. See [Per-session client isolation](#per-session-client-isolation-stateful-servers). |
+| `tools`, `prompts`, `resources` | object | no | Per-item overrides: `{ "<name>": { "enabled": true, "description": "..." } }`. Managed via the dashboard or the per-resource API endpoints. |
 
-| Field          | Type    | Default         | Description                 |
-| -------------- | ------- | --------------- | --------------------------- |
-| `env`          | object  | `{}`            | Environment variables       |
+### `type: "stdio"` (default)
+
+| Field | Type | Required | Description |
+| ----- | ---- | -------- | ----------- |
+| `command` | string | yes | Executable to spawn. |
+| `args` | string[] | no | Command-line arguments. |
+| `env` | object | no | Extra environment variables for the child process. `${ENV}` placeholders in values are expanded against the MCPHub process environment. |
+
+### `type: "sse"` or `type: "streamable-http"`
+
+| Field | Type | Required | Description |
+| ----- | ---- | -------- | ----------- |
+| `url` | string | yes | Upstream endpoint URL. |
+| `headers` | object | no | Static headers sent on every request. |
+| `passthroughHeaders` | string[] | no | Inbound HTTP header names to forward from the caller to the upstream server. |
+
+### `type: "openapi"`
+
+| Field | Type | Required | Description |
+| ----- | ---- | -------- | ----------- |
+| `openapi.url` | string | one of `url`/`schema` | URL of an OpenAPI document MCPHub will download. |
+| `openapi.schema` | object | one of `url`/`schema` | Inline OpenAPI document. |
+| `headers` | object | no | Static headers applied to outbound calls, including the spec download itself. |
+| `openapi.passthroughHeaders` | string[] | no | Headers to forward from the caller. |
+
+The authoritative definition of every field is the `ServerConfig` type in [src/types/index.ts](src/types/index.ts) — consult it if you need behavior not described here.
+
+<Note>
+A protected `openapi.url` is downloaded through MCPHub's authenticated client, so the
+configured `headers` and OpenAPI `security` credentials (HTTP Basic/Bearer, API key,
+OAuth2 token) authenticate the fetch. Credentials are scoped to the document origin only —
+they are **not** forwarded to external `$ref` resolutions or cross-origin redirects. If a
+protected document references external `$ref`s that also require auth, inline the document
+via `openapi.schema` instead.
+</Note>
 
 ## Common MCP Server Examples
 
@@ -109,6 +152,57 @@ MCPHub uses several configuration files:
   }
 }
 ```
+
+### Per-session client isolation (stateful servers)
+
+By default MCPHub keeps a **single** upstream connection per server and shares it
+across every downstream MCP session. For stateful servers this means all clients
+share the same state — with Playwright, for example, every session drives the same
+browser instance and its tabs.
+
+Set `perSessionClient: true` to make MCPHub open a **dedicated upstream client per
+downstream session** instead. Each session gets its own connection (and, for
+stdio servers, its own child process), created lazily on first tool call and torn
+down automatically when the session ends.
+
+<Note>
+`perSessionClient` is a **MCPHub-side** setting: it controls how many upstream
+connections MCPHub opens. It is distinct from Playwright MCP's own `--isolated`
+flag, which controls browser-profile isolation on the Playwright side. The two
+pair naturally — enable both for fully isolated browser sessions.
+</Note>
+
+```json
+{
+  "mcpServers": {
+    "playwright": {
+      "type": "streamable-http",
+      "url": "http://playwright-mcp:3000/mcp",
+      "perSessionClient": true
+    }
+  }
+}
+```
+
+Or with a locally spawned Playwright MCP using its `--isolated` flag:
+
+```json
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["@playwright/mcp@latest", "--headless", "--isolated"],
+      "perSessionClient": true
+    }
+  }
+}
+```
+
+<Tip>
+Only enable `perSessionClient` for servers that actually hold per-session state.
+It multiplies upstream connections (and stdio child processes) by the number of
+concurrent sessions, so leave it off for stateless servers.
+</Tip>
 
 ### File and System Servers
 
@@ -158,23 +252,6 @@ MCPHub uses several configuration files:
 }
 ```
 
-#### Email Server
-
-```json
-{
-  "email": {
-    "command": "python",
-    "args": ["-m", "mcp_server_email"],
-    "env": {
-      "SMTP_HOST": "smtp.gmail.com",
-      "SMTP_PORT": "587",
-      "EMAIL_USER": "${EMAIL_USER}",
-      "EMAIL_PASSWORD": "${EMAIL_PASSWORD}"
-    }
-  }
-}
-```
-
 ### Development and API Servers
 
 #### GitHub Server
@@ -191,22 +268,6 @@ MCPHub uses several configuration files:
 }
 ```
 
-#### Google Drive Server
-
-```json
-{
-  "gdrive": {
-    "command": "npx",
-    "args": ["-y", "@google/mcp-server-gdrive"],
-    "env": {
-      "GOOGLE_CLIENT_ID": "${GOOGLE_CLIENT_ID}",
-      "GOOGLE_CLIENT_SECRET": "${GOOGLE_CLIENT_SECRET}",
-      "GOOGLE_REFRESH_TOKEN": "${GOOGLE_REFRESH_TOKEN}"
-    }
-  }
-}
-```
-
 ### Map and Location Services
 
 #### Amap (高德地图) Server
@@ -217,26 +278,15 @@ MCPHub uses several configuration files:
     "command": "npx",
     "args": ["-y", "@amap/amap-maps-mcp-server"],
     "env": {
-      "AMAP_MAPS_API_KEY": "${AMAP_API_KEY}",
-      "AMAP_LANGUAGE": "zh-cn"
+      "AMAP_MAPS_API_KEY": "${AMAP_API_KEY}"
     }
   }
 }
 ```
 
-#### OpenStreetMap Server
-
-```json
-{
-  "osm": {
-    "command": "python",
-    "args": ["-m", "mcp_server_osm"],
-    "env": {
-      "OSM_USER_AGENT": "MCPHub/1.0"
-    }
-  }
-}
-```
+<Tip>
+  Looking for more servers? The bundled [Market catalog](https://docs.mcphub.app/features/server-management) in the dashboard lists hundreds of known MCP servers with copy-paste-ready configurations.
+</Tip>
 
 ## Advanced Configuration
 
@@ -444,6 +494,16 @@ Complement `mcp_settings.json` with server metadata:
 }
 ```
 
+## Editing mcp_settings.json while running
+
+In file mode, MCPHub re-reads `mcp_settings.json` when it changes, without a restart:
+
+- **Server definitions and credentials** are picked up on the next server reload — `POST /api/servers/:name/reload`, the `reload` button in the dashboard, or `mcphub servers reload <name>`.
+- **System settings** (`systemConfig`, e.g. `nameSeparator`) are picked up on the next read once the file has changed.
+- Settings that are read once at process startup still require a restart to take effect: the Better Auth bootstrap, `skipAuth`, the listening port, and anything driven by environment variables.
+
+In database mode (`USE_DB=true`), `mcp_settings.json` is only a one-time seed; edit configuration through the dashboard, API, or CLI instead.
+
 {/* ### Access Control
 
 | Access Level    | Description                |
@@ -499,6 +559,40 @@ You can also configure runtime routing and authentication behavior under `system
 - `bearerAuthHeaderName` defaults to `Authorization` and controls which incoming header MCPHub reads for Bearer authentication.
 - Use a custom header such as `X-MCP-Authorization` when an upstream MCP/OpenAPI server also needs to passthrough `Authorization`.
 - `jsonBodyLimit` defaults to `1mb` and controls the Express JSON parser limit for API requests, including large inline OpenAPI schema uploads.
+
+## Tool Result Compression
+
+MCPHub can transparently compress large text tool results before returning them to MCP clients. This is useful when upstream tools return large logs, diffs, search output, JSON arrays, or long text blobs that would otherwise consume too much model context.
+
+Tool result compression is disabled by default. Enable and tune it from **Settings → Tool Result Compression**, or configure it under `systemConfig.toolResultCompression`:
+
+```json
+{
+  "systemConfig": {
+    "toolResultCompression": {
+      "enabled": false,
+      "minTokens": 2000,
+      "maxOutputTokens": 1200,
+      "strategy": "auto"
+    }
+  }
+}
+```
+
+| Field | Type | Default | Description |
+| ----- | ---- | ------- | ----------- |
+| `enabled` | boolean | `false` | Enable transparent compression for successful tool results. |
+| `minTokens` | number | `2000` | Only compress a text block when its estimated token count is at or above this threshold. |
+| `maxOutputTokens` | number | `1200` | Target token budget for each compressed text block. |
+| `strategy` | `"auto" \| "json" \| "log" \| "search" \| "diff" \| "text"` | `"auto"` | Compression strategy. `auto` detects common structured output formats. |
+
+Compression only applies to successful tool responses. Responses with `isError: true` are returned unchanged, non-text content blocks are preserved, and each text block is evaluated independently. When MCPHub compresses a result, it prepends a marker such as:
+
+```text
+[mcphub:compressed-tool-result strategy=log original_tokens=9000 compressed_tokens=1200 omitted_lines=240]
+```
+
+The activity log records the original upstream output before compression, so operators can inspect full results in MCPHub even when clients receive compressed content.
 
 ## Best Practices
 

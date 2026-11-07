@@ -1,5 +1,8 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { Request } from 'express';
+import ipaddr from 'ipaddr.js';
+import type { BearerKeyKind } from '../types/index.js';
+import type { HostedAuthContext } from './hostedAuthService.js';
 
 /**
  * Request context interface for MCP request handling
@@ -10,9 +13,32 @@ export interface RequestContext {
   userAgent?: string;
   remoteAddress?: string;
   group?: string;
+  username?: string;
   keyId?: string;
   keyName?: string;
+  keyKind?: BearerKeyKind;
+  hostedAuth?: HostedAuthContext;
 }
+
+const normalizeRemoteAddress = (remoteAddress?: string): string | undefined => {
+  if (!remoteAddress) {
+    return undefined;
+  }
+
+  const trimmedRemoteAddress = remoteAddress.trim();
+  if (!trimmedRemoteAddress) {
+    return undefined;
+  }
+
+  if (ipaddr.isValid(trimmedRemoteAddress)) {
+    const parsedAddress = ipaddr.parse(trimmedRemoteAddress);
+    if (parsedAddress instanceof ipaddr.IPv6 && parsedAddress.isIPv4MappedAddress()) {
+      return parsedAddress.toIPv4Address().toString();
+    }
+  }
+
+  return trimmedRemoteAddress;
+};
 
 /**
  * Service for managing request context during MCP request processing
@@ -36,7 +62,7 @@ export class RequestContextService {
       headers: req.headers,
       sessionId: (req.headers['mcp-session-id'] as string) || undefined,
       userAgent: req.headers['user-agent'] as string,
-      remoteAddress: req.ip || req.socket?.remoteAddress,
+      remoteAddress: normalizeRemoteAddress(req.ip || req.socket?.remoteAddress),
     };
   }
 
@@ -44,6 +70,7 @@ export class RequestContextService {
     return {
       ...context,
       headers: { ...context.headers },
+      remoteAddress: normalizeRemoteAddress(context.remoteAddress),
     };
   }
 
@@ -54,7 +81,10 @@ export class RequestContextService {
   }
 
   public runWithCustomRequestContext<T>(context: RequestContext, callback: () => T): T;
-  public runWithCustomRequestContext<T>(context: RequestContext, callback: () => Promise<T>): Promise<T>;
+  public runWithCustomRequestContext<T>(
+    context: RequestContext,
+    callback: () => Promise<T>,
+  ): Promise<T>;
   public runWithCustomRequestContext<T>(
     context: RequestContext,
     callback: () => T | Promise<T>,
@@ -146,12 +176,42 @@ export class RequestContextService {
   }
 
   /**
+   * Set hosted auth context for hosted data-plane authorization and usage.
+   */
+  public setHostedAuthContext(hostedAuth?: HostedAuthContext): void {
+    const requestContext = this.getRequestContext();
+    if (requestContext) {
+      requestContext.hostedAuth = hostedAuth;
+    }
+  }
+
+  /**
    * Set group context for activity logging
    */
   public setGroupContext(group?: string): void {
     const requestContext = this.getRequestContext();
     if (requestContext) {
       requestContext.group = group;
+    }
+  }
+
+  /**
+   * Set username context for activity logging
+   */
+  public setUsernameContext(username?: string): void {
+    const requestContext = this.getRequestContext();
+    if (requestContext) {
+      requestContext.username = username;
+    }
+  }
+
+  /**
+   * Set key kind context for activity logging
+   */
+  public setKeyKindContext(keyKind?: BearerKeyKind): void {
+    const requestContext = this.getRequestContext();
+    if (requestContext) {
+      requestContext.keyKind = keyKind;
     }
   }
 
@@ -171,5 +231,23 @@ export class RequestContextService {
    */
   public getGroupContext(): string | undefined {
     return this.getRequestContext()?.group;
+  }
+
+  /**
+   * Get username context
+   */
+  public getUsernameContext(): string | undefined {
+    return this.getRequestContext()?.username;
+  }
+
+  /**
+   * Get key kind context
+   */
+  public getKeyKindContext(): BearerKeyKind | undefined {
+    return this.getRequestContext()?.keyKind;
+  }
+
+  public getHostedAuthContext(): HostedAuthContext | undefined {
+    return this.getRequestContext()?.hostedAuth;
   }
 }

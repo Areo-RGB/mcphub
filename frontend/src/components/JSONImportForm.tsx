@@ -1,27 +1,11 @@
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { apiPost } from '@/utils/fetchInterceptor';
+import { ImportJsonFormat, normalizeImportedServers } from '../utils/jsonImport';
 
 interface JSONImportFormProps {
   onSuccess: () => void;
   onCancel: () => void;
-}
-
-interface McpServerConfig {
-  command?: string;
-  args?: string[];
-  env?: Record<string, string>;
-  type?: string;
-  url?: string;
-  headers?: Record<string, string>;
-  openapi?: {
-    version: string;
-    url: string;
-  };
-}
-
-interface ImportJsonFormat {
-  mcpServers: Record<string, McpServerConfig>;
 }
 
 const JSONImportForm: React.FC<JSONImportFormProps> = ({ onSuccess, onCancel }) => {
@@ -85,31 +69,15 @@ All servers will be imported in a single efficient batch operation.`;
     const parsed = parseAndValidateJson(jsonInput);
     if (!parsed) return;
 
-    const servers = Object.entries(parsed.mcpServers).map(([name, config]) => {
-      // Normalize config to MCPHub format
-      const normalizedConfig: any = {};
+    const { servers, issues } = normalizeImportedServers(parsed);
 
-      if (config.type === 'sse' || config.type === 'streamable-http') {
-        normalizedConfig.type = config.type;
-        normalizedConfig.url = config.url;
-        if (config.headers) {
-          normalizedConfig.headers = config.headers;
-        }
-      } else if (config.type === 'openapi') {
-        normalizedConfig.type = 'openapi';
-        normalizedConfig.openapi = config.openapi;
-      } else {
-        // Default to stdio
-        normalizedConfig.type = 'stdio';
-        normalizedConfig.command = config.command;
-        normalizedConfig.args = config.args || [];
-        if (config.env) {
-          normalizedConfig.env = config.env;
-        }
+    if (issues.length > 0) {
+      const details = issues.map((issue) => `${issue.name}: ${issue.message}`).join('\n');
+      setError(t('jsonImport.validationErrors') + '\n' + details);
+      if (servers.length === 0) {
+        return;
       }
-
-      return { name, config: normalizedConfig };
-    });
+    }
 
     setPreviewServers(servers);
   };
@@ -157,7 +125,7 @@ All servers will be imported in a single efficient batch operation.`;
 
   return (
     <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-      <div className="bg-white shadow rounded-lg p-6 w-full max-w-4xl max-h-[90vh] overflow-y-auto">
+      <div className="bg-white dark:bg-gray-800 shadow rounded-lg p-6 w-full max-w-4xl max-h-[90vh] overflow-y-auto">
         <div className="flex justify-between items-center mb-6">
           <h2 className="text-xl font-semibold text-gray-900">{t('jsonImport.title')}</h2>
           <button onClick={onCancel} className="text-gray-500 hover:text-gray-700">
@@ -189,14 +157,14 @@ All servers will be imported in a single efficient batch operation.`;
             <div className="flex justify-end space-x-4">
               <button
                 onClick={onCancel}
-                className="px-4 py-2 text-gray-700 bg-gray-200 rounded hover:bg-gray-300 btn-secondary"
+                className="hub-btn"
               >
                 {t('common.cancel')}
               </button>
               <button
                 onClick={handlePreview}
                 disabled={!jsonInput.trim()}
-                className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 btn-primary"
+                className="hub-btn primary"
               >
                 {t('jsonImport.preview')}
               </button>
@@ -210,7 +178,7 @@ All servers will be imported in a single efficient batch operation.`;
               </h3>
               <div className="space-y-3">
                 {previewServers.map((server, index) => (
-                  <div key={index} className="bg-gray-50 p-4 rounded-lg border border-gray-200">
+                  <div key={index} className="bg-gray-50 dark:bg-gray-800 p-4 rounded-lg border border-gray-200 dark:border-gray-700">
                     <div className="flex items-start justify-between">
                       <div className="flex-1">
                         <h4 className="font-medium text-gray-900">{server.name}</h4>
@@ -259,14 +227,14 @@ All servers will be imported in a single efficient batch operation.`;
               <button
                 onClick={() => setPreviewServers(null)}
                 disabled={isImporting}
-                className="px-4 py-2 text-gray-700 bg-gray-200 rounded hover:bg-gray-300 disabled:opacity-50 btn-secondary"
+                className="hub-btn"
               >
                 {t('common.back')}
               </button>
               <button
                 onClick={handleImport}
                 disabled={isImporting}
-                className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 flex items-center btn-primary"
+                className="hub-btn primary"
               >
                 {isImporting ? (
                   <>

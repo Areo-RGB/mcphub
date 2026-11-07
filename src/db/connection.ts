@@ -1,3 +1,4 @@
+import { initializeWithGroupNameCheck } from './groupSchema.js';
 import 'reflect-metadata'; // Ensure reflect-metadata is imported here too
 import { DataSource, DataSourceOptions } from 'typeorm';
 import entities from './entities/index.js';
@@ -6,6 +7,8 @@ import { VectorEmbeddingSubscriber } from './subscribers/VectorEmbeddingSubscrib
 import { getSmartRoutingConfig } from '../utils/smartRouting.js';
 import { createVectorIndex } from '../services/vectorSearchService.js';
 import { isRetryableDbError } from '../utils/dbRetry.js';
+import { withTimeout } from '../utils/withTimeout.js';
+import { logger } from '../utils/logger.js';
 
 // Connection pool and retry configuration
 const CONNECTION_CONFIG = {
@@ -14,12 +17,23 @@ const CONNECTION_CONFIG = {
   poolIdleTimeout: parseInt(process.env.DB_POOL_IDLE_TIMEOUT || '30000', 10), // 30 seconds
   connectionTimeout: parseInt(process.env.DB_CONNECTION_TIMEOUT || '60000', 10), // 60 seconds
 
-  // Retry settings for initial connection
+  // Automatic reconnection settings
   maxConnectionRetries: parseInt(process.env.DB_MAX_CONNECTION_RETRIES || '5', 10),
   connectionRetryDelayMs: parseInt(process.env.DB_CONNECTION_RETRY_DELAY || '3000', 10),
+  // Bounds pool teardown during reconnection. pg-pool's end() only completes
+  // once every client is returned, so a client stuck in an open transaction
+  // (idle in transaction) would otherwise wedge reconnection forever (#1205).
+  destroyTimeout: parseInt(process.env.DB_DESTROY_TIMEOUT || '15000', 10), // 15 seconds
+
+  // Postgres-side safety valves (0 = use PostgreSQL defaults / disabled). Set
+  // per-connection via the startup packet so a hung query or a session left in
+  // `idle in transaction` cannot hold a pooled connection indefinitely.
+  statementTimeout: parseInt(process.env.DB_STATEMENT_TIMEOUT || '0', 10),
+  idleInTransactionSessionTimeout: parseInt(process.env.DB_IDLE_IN_TRANSACTION_TIMEOUT || '0', 10),
 
   // Health check settings
   healthCheckIntervalMs: parseInt(process.env.DB_HEALTH_CHECK_INTERVAL || '30000', 10), // 30 seconds
+  healthCheckQueryTimeout: parseInt(process.env.DB_HEALTH_CHECK_QUERY_TIMEOUT || '5000', 10), // 5 seconds
   enableHealthCheck: process.env.DB_ENABLE_HEALTH_CHECK !== 'false',
 };
 
@@ -28,23 +42,24 @@ let healthCheckInterval: NodeJS.Timeout | null = null;
 let isHealthy = false;
 let lastHealthCheckError: Error | null = null;
 let reconnectionInProgress = false;
+let reconnectionPromise: Promise<DataSource> | null = null;
 
 // Helper function to create required PostgreSQL extensions
 const createRequiredExtensions = async (dataSource: DataSource): Promise<void> => {
   try {
     await dataSource.query('CREATE EXTENSION IF NOT EXISTS "uuid-ossp";');
-    console.log('UUID extension created or already exists.');
+    logger.log('UUID extension created or already exists.');
   } catch (err: any) {
-    console.warn('Failed to create uuid-ossp extension:', err.message);
-    console.warn('UUID generation functionality may not be available.');
+    logger.warn('Failed to create uuid-ossp extension:', err.message);
+    logger.warn('UUID generation functionality may not be available.');
   }
 
   try {
     await dataSource.query('CREATE EXTENSION IF NOT EXISTS vector;');
-    console.log('Vector extension created or already exists.');
+    logger.log('Vector extension created or already exists.');
   } catch (err: any) {
-    console.warn('Failed to create vector extension:', err.message);
-    console.warn('Vector functionality may not be available.');
+    logger.warn('Failed to create vector extension:', err.message);
+    logger.warn('Vector functionality may not be available.');
   }
 };
 
@@ -66,7 +81,7 @@ const ensureEmbeddingColumnIsVector = async (dataSource: DataSource): Promise<vo
       ALTER TABLE vector_embeddings
       ADD COLUMN embedding vector;
     `);
-    console.log('Created missing embedding column with vector type.');
+    logger.log('Created missing embedding column with vector type.');
     return;
   }
 
@@ -79,7 +94,7 @@ const ensureEmbeddingColumnIsVector = async (dataSource: DataSource): Promise<vo
     ALTER TABLE vector_embeddings
     ALTER COLUMN embedding TYPE vector USING embedding::vector;
   `);
-  console.log('Vector embedding column type updated successfully.');
+  logger.log('Vector embedding column type updated successfully.');
 };
 
 // Default database configuration with connection pooling
@@ -101,6 +116,11 @@ const getDefaultConfig = async (): Promise<DataSourceOptions> => {
       // Keep-alive settings to detect dead connections faster
       keepAlive: true,
       keepAliveInitialDelayMillis: 10000,
+      // Postgres-side safety valves (0 = PostgreSQL default / disabled): a
+      // hung query or a session stuck in `idle in transaction` must not be
+      // able to hold a pooled connection indefinitely (#1205).
+      statement_timeout: CONNECTION_CONFIG.statementTimeout,
+      idle_in_transaction_session_timeout: CONNECTION_CONFIG.idleInTransactionSessionTimeout,
     },
   };
 };
@@ -120,7 +140,7 @@ export const updateDataSourceConfig = async (): Promise<DataSource> => {
     const currentUrl = (appDataSource.options as any).url;
     const newUrl = (newConfig as any).url;
     if (currentUrl !== newUrl) {
-      console.log('Database URL configuration changed, updating DataSource...');
+      logger.log('Database URL configuration changed, updating DataSource...');
       appDataSource = new DataSource(newConfig);
       // Reset initialization promise when configuration changes
       initializationPromise = null;
@@ -141,23 +161,12 @@ export const getAppDataSource = (): DataSource => {
   return appDataSource;
 };
 
-// Reconnect database with updated configuration
+// Reconnect the database using the current DataSource configuration
 export const reconnectDatabase = async (): Promise<DataSource> => {
   try {
-    // Close existing connection if it exists
-    if (appDataSource && appDataSource.isInitialized) {
-      console.log('Closing existing database connection...');
-      await appDataSource.destroy();
-    }
-
-    // Reset initialization promise to allow fresh initialization
-    initializationPromise = null;
-
-    // Update configuration and reconnect
-    appDataSource = await updateDataSourceConfig();
-    return await initializeDatabase();
+    return await attemptReconnection();
   } catch (error) {
-    console.error('Error during database reconnection:', error);
+    logger.error('Error during database reconnection:', error);
     throw error;
   }
 };
@@ -166,13 +175,13 @@ export const reconnectDatabase = async (): Promise<DataSource> => {
 export const initializeDatabase = async (): Promise<DataSource> => {
   // If initialization is already in progress, wait for it to complete
   if (initializationPromise) {
-    console.log('Database initialization already in progress, waiting for completion...');
+    logger.log('Database initialization already in progress, waiting for completion...');
     return initializationPromise;
   }
 
   // If already initialized, return the existing instance
   if (appDataSource && appDataSource.isInitialized) {
-    console.log('Database already initialized, returning existing instance');
+    logger.log('Database already initialized, returning existing instance');
     return Promise.resolve(appDataSource);
   }
 
@@ -181,7 +190,7 @@ export const initializeDatabase = async (): Promise<DataSource> => {
 
   try {
     const result = await initializationPromise;
-    console.log('Database initialization completed successfully');
+    logger.log('Database initialization completed successfully');
 
     // Start health check after successful initialization
     isHealthy = true;
@@ -191,7 +200,7 @@ export const initializeDatabase = async (): Promise<DataSource> => {
   } catch (error) {
     // Reset the promise on error so initialization can be retried
     initializationPromise = null;
-    console.error('Database initialization failed:', error);
+    logger.error('Database initialization failed:', error);
     throw error;
   }
 };
@@ -203,9 +212,9 @@ const performDatabaseInitialization = async (): Promise<DataSource> => {
     appDataSource = await updateDataSourceConfig();
 
     if (!appDataSource.isInitialized) {
-      console.log('Initializing database connection...');
+      logger.log('Initializing database connection...');
       // Register the vector type with TypeORM
-      await appDataSource.initialize();
+      await initializeWithGroupNameCheck(appDataSource);
       registerPostgresVectorType(appDataSource);
 
       // Create required PostgreSQL extensions
@@ -222,23 +231,71 @@ const performDatabaseInitialization = async (): Promise<DataSource> => {
           );
         `);
 
-        if (tableExists[0].exists) {
+        // ⚠️  synchronize: false is set on this entity. TypeORM will NOT auto-apply
+        // future schema changes. Any new columns / type changes MUST be added:
+        //   1. In the CREATE TABLE statement below (for new installs)
+        //   2. As ALTER TABLE ADD COLUMN IF NOT EXISTS checks (for existing installs)
+        // Consider adding TypeORM migrations for this table.
+        let justCreated = false;
+        if (!tableExists[0].exists) {
+          // vector_embeddings has synchronize:false on the entity (prevents the
+          // TypeORM DROP+ADD cycle that nulls stored embeddings on every startup).
+          // Create the table manually so new installations work correctly.
+          logger.log('Creating vector_embeddings table...');
+          await appDataSource.query(`
+            CREATE TABLE IF NOT EXISTS vector_embeddings (
+              id           uuid                        NOT NULL DEFAULT uuid_generate_v4() PRIMARY KEY,
+              content_type character varying           NOT NULL,
+              content_id   character varying           NOT NULL,
+              text_content text                        NOT NULL,
+              metadata     text                        NOT NULL,
+              dimensions   integer                     NOT NULL,
+              model        character varying           NOT NULL,
+              created_at   timestamp without time zone NOT NULL DEFAULT now(),
+              updated_at   timestamp without time zone NOT NULL DEFAULT now(),
+              embedding    vector
+            );
+          `);
+          justCreated = true;
+        }
+
+        // Ensure the unique index exists (needed for atomic ON CONFLICT upserts).
+        // Deduplicate first — duplicate rows cause CREATE UNIQUE INDEX to fail,
+        // which would silently leave saveEmbedding() broken on affected installs.
+        try {
+          await appDataSource.query(`
+            DELETE FROM vector_embeddings
+            WHERE id NOT IN (
+              SELECT DISTINCT ON (content_type, content_id) id
+              FROM vector_embeddings
+              ORDER BY content_type, content_id, updated_at DESC NULLS LAST
+            );
+          `);
+          await appDataSource.query(`
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_vector_embeddings_content
+            ON vector_embeddings (content_type, content_id);
+          `);
+        } catch (idxError: any) {
+          logger.warn('Could not create unique index on vector_embeddings:', idxError.message);
+        }
+
+        if (tableExists[0].exists || justCreated) {
           // Add pgvector support via raw SQL commands
-          console.log('Configuring vector support for embeddings table...');
+          logger.log('Configuring vector support for embeddings table...');
 
           // Step 1: Drop any existing index on the column
           try {
             await appDataSource.query(`DROP INDEX IF EXISTS idx_vector_embeddings_embedding;`);
           } catch (dropError: any) {
-            console.warn('Note: Could not drop existing index:', dropError.message);
+            logger.warn('Note: Could not drop existing index:', dropError.message);
           }
 
           // Step 2: Ensure embedding column exists and uses vector type
           try {
             await ensureEmbeddingColumnIsVector(appDataSource);
           } catch (alterError: any) {
-            console.warn('Could not alter embedding column type:', alterError.message);
-            console.warn('Will try to recreate the table later.');
+            logger.warn('Could not alter embedding column type:', alterError.message);
+            logger.warn('Will try to recreate the table later.');
           }
 
           // Step 3: Try to create appropriate indices
@@ -251,9 +308,9 @@ const performDatabaseInitialization = async (): Promise<DataSource> => {
             let dimensions = 1536; // Default to common OpenAI embedding size
             if (records && records.length > 0 && records[0].dimensions) {
               dimensions = records[0].dimensions;
-              console.log(`Found vector dimension from existing data: ${dimensions}`);
+              logger.log(`Found vector dimension from existing data: ${dimensions}`);
             } else {
-              console.log(`Using default vector dimension: ${dimensions} (no existing data found)`);
+              logger.log(`Using default vector dimension: ${dimensions} (no existing data found)`);
             }
 
             // Set the vector dimensions explicitly only if table has data
@@ -266,34 +323,30 @@ const performDatabaseInitialization = async (): Promise<DataSource> => {
               // Create appropriate vector index using the helper function
               const result = await createVectorIndex(appDataSource, dimensions);
               if (!result.success) {
-                console.log('Continuing without optimized vector index...');
+                logger.log('Continuing without optimized vector index...');
               }
             } else {
-              console.log(
+              logger.log(
                 'No existing vector data found, skipping index creation - will be handled by vector service.',
               );
             }
           } catch (indexError: any) {
-            console.warn('Vector index creation failed:', indexError.message);
-            console.warn('Vector search will work but may be slower without an optimized index.');
+            logger.warn('Vector index creation failed:', indexError.message);
+            logger.warn('Vector search will work but may be slower without an optimized index.');
           }
-        } else {
-          console.log(
-            'Vector embeddings table does not exist yet - will configure after schema sync.',
-          );
         }
       } catch (error: any) {
-        console.warn('Could not set up vector column/index:', error.message);
-        console.warn('Will attempt again after schema synchronization.');
+        logger.warn('Could not set up vector column/index:', error.message);
+        logger.warn('Will attempt again after schema synchronization.');
       }
 
-      console.log('Database connection established successfully.');
+      logger.log('Database connection established successfully.');
 
       // Run one final setup check after schema synchronization is done
       const config = await getDefaultConfig();
       if (config.synchronize) {
         try {
-          console.log('Running final vector configuration check...');
+          logger.log('Running final vector configuration check...');
 
           // Try setup again with the same code from above
           const tableExists = await appDataSource.query(`
@@ -305,12 +358,15 @@ const performDatabaseInitialization = async (): Promise<DataSource> => {
             `);
 
           if (tableExists[0].exists) {
-            console.log('Vector embeddings table found, checking configuration...');
+            logger.log('Vector embeddings table found, checking configuration...');
 
             try {
               await ensureEmbeddingColumnIsVector(appDataSource);
             } catch (alterError: any) {
-              console.warn('Could not ensure embedding column type in final check:', alterError.message);
+              logger.warn(
+                'Could not ensure embedding column type in final check:',
+                alterError.message,
+              );
             }
 
             // Get the dimension size first
@@ -323,37 +379,37 @@ const performDatabaseInitialization = async (): Promise<DataSource> => {
               // Only proceed if we have existing data, otherwise let vector service handle it
               if (records && records.length > 0 && records[0].dimensions) {
                 const dimensions = records[0].dimensions;
-                console.log(`Found vector dimension from database: ${dimensions}`);
+                logger.log(`Found vector dimension from database: ${dimensions}`);
 
                 // Ensure column type is vector with explicit dimensions
                 await appDataSource.query(`
                     ALTER TABLE vector_embeddings 
                     ALTER COLUMN embedding TYPE vector(${dimensions});
                   `);
-                console.log('Vector embedding column type updated in final check.');
+                logger.log('Vector embedding column type updated in final check.');
 
                 // Create appropriate vector index using the helper function
                 const result = await createVectorIndex(appDataSource, dimensions);
                 if (!result.success) {
-                  console.log('Continuing without optimized vector index...');
+                  logger.log('Continuing without optimized vector index...');
                 }
               } else {
-                console.log(
+                logger.log(
                   'No existing vector data found, vector dimensions will be configured by vector service.',
                 );
               }
             } catch (setupError: any) {
-              console.warn('Vector setup in final check failed:', setupError.message);
+              logger.warn('Vector setup in final check failed:', setupError.message);
             }
           }
         } catch (error: any) {
-          console.warn('Post-initialization vector setup failed:', error.message);
+          logger.warn('Post-initialization vector setup failed:', error.message);
         }
       }
     }
     return appDataSource;
   } catch (error) {
-    console.error('Error during database initialization:', error);
+    logger.error('Error during database initialization:', error);
     throw error;
   }
 };
@@ -380,29 +436,55 @@ export const getDatabaseHealth = (): {
 
 // Perform a health check on the database connection
 export const checkDatabaseHealth = async (): Promise<boolean> => {
-  if (!appDataSource || !appDataSource.isInitialized) {
+  if (!appDataSource) {
     isHealthy = false;
     lastHealthCheckError = new Error('Database not initialized');
     return false;
   }
 
+  if (!appDataSource.isInitialized) {
+    isHealthy = false;
+    lastHealthCheckError = new Error('Database not initialized');
+    logger.log('[DB Health] DataSource is disconnected, attempting reconnection...');
+
+    try {
+      await attemptReconnection();
+      return true;
+    } catch (error) {
+      lastHealthCheckError = error instanceof Error ? error : new Error(String(error));
+      logger.error('[DB Health] Reconnection attempt failed:', lastHealthCheckError.message);
+      return false;
+    }
+  }
+
   try {
-    // Simple query to check connection
-    await appDataSource.query('SELECT 1');
+    // Simple query to check connection. Bounded by a short timeout so a DB
+    // that stops accepting queries cannot stall the health probe for the full
+    // pool connection timeout (#1205).
+    await withTimeout(
+      appDataSource.query('SELECT 1'),
+      CONNECTION_CONFIG.healthCheckQueryTimeout,
+      `DB health check failed: connection timeout after ${CONNECTION_CONFIG.healthCheckQueryTimeout}ms`,
+    );
     isHealthy = true;
     lastHealthCheckError = null;
     return true;
   } catch (error) {
     isHealthy = false;
     lastHealthCheckError = error instanceof Error ? error : new Error(String(error));
-    console.warn('[DB Health] Health check failed:', lastHealthCheckError.message);
+    logger.warn('[DB Health] Health check failed:', lastHealthCheckError.message);
 
     // If it's a retryable error, attempt reconnection
-    if (isRetryableDbError(error) && !reconnectionInProgress) {
-      console.log('[DB Health] Detected connection issue, attempting reconnection...');
-      attemptReconnection().catch((err) => {
-        console.error('[DB Health] Reconnection attempt failed:', err.message);
-      });
+    if (isRetryableDbError(error)) {
+      logger.log('[DB Health] Detected connection issue, attempting reconnection...');
+      try {
+        await attemptReconnection();
+        return true;
+      } catch (reconnectError) {
+        lastHealthCheckError =
+          reconnectError instanceof Error ? reconnectError : new Error(String(reconnectError));
+        logger.error('[DB Health] Reconnection attempt failed:', lastHealthCheckError.message);
+      }
     }
 
     return false;
@@ -415,7 +497,7 @@ export const startHealthCheck = (): void => {
     return;
   }
 
-  console.log(
+  logger.log(
     `[DB Health] Starting health check (interval: ${CONNECTION_CONFIG.healthCheckIntervalMs}ms)`,
   );
 
@@ -432,69 +514,116 @@ export const stopHealthCheck = (): void => {
   if (healthCheckInterval) {
     clearInterval(healthCheckInterval);
     healthCheckInterval = null;
-    console.log('[DB Health] Health check stopped');
+    logger.log('[DB Health] Health check stopped');
   }
 };
 
 // Attempt to reconnect to the database with retries
-const attemptReconnection = async (): Promise<void> => {
-  if (reconnectionInProgress) {
-    console.log('[DB Reconnect] Reconnection already in progress, skipping...');
-    return;
+const attemptReconnection = (): Promise<DataSource> => {
+  if (reconnectionPromise) {
+    logger.log('[DB Reconnect] Reconnection already in progress, waiting...');
+    return reconnectionPromise;
   }
 
-  reconnectionInProgress = true;
-  console.log('[DB Reconnect] Starting reconnection attempt...');
+  const promise = (async () => {
+    reconnectionInProgress = true;
+    logger.log('[DB Reconnect] Starting reconnection attempt...');
 
-  try {
-    // Close existing connection if it exists
-    if (appDataSource && appDataSource.isInitialized) {
-      try {
-        console.log('[DB Reconnect] Closing existing connection...');
-        await appDataSource.destroy();
-      } catch (closeError: any) {
-        console.warn('[DB Reconnect] Error closing connection:', closeError.message);
+    try {
+      if (!appDataSource) {
+        return await initializeDatabase();
       }
-    }
 
-    // Reset state
-    initializationPromise = null;
+      let dataSource = appDataSource;
 
-    // Retry connection with exponential backoff
-    let lastError: Error | null = null;
-    for (let attempt = 1; attempt <= CONNECTION_CONFIG.maxConnectionRetries; attempt++) {
-      try {
-        console.log(
-          `[DB Reconnect] Connection attempt ${attempt}/${CONNECTION_CONFIG.maxConnectionRetries}...`,
-        );
-
-        appDataSource = await updateDataSourceConfig();
-        await performDatabaseInitialization();
-
-        console.log('[DB Reconnect] Successfully reconnected to database');
-        isHealthy = true;
-        lastHealthCheckError = null;
-        return;
-      } catch (error) {
-        lastError = error instanceof Error ? error : new Error(String(error));
-        console.warn(`[DB Reconnect] Attempt ${attempt} failed: ${lastError.message}`);
-
-        if (attempt < CONNECTION_CONFIG.maxConnectionRetries) {
-          const delay = CONNECTION_CONFIG.connectionRetryDelayMs * Math.pow(2, attempt - 1);
-          console.log(`[DB Reconnect] Waiting ${delay}ms before next attempt...`);
-          await new Promise((resolve) => setTimeout(resolve, delay));
+      if (dataSource.isInitialized) {
+        try {
+          logger.log('[DB Reconnect] Closing existing connection...');
+          // pg-pool end() waits for every checked-out client. A client stuck
+          // in an open transaction would make destroy() hang forever, wedging
+          // the whole reconnection machinery — bound it and fall back to a
+          // fresh pool instead (#1205).
+          await withTimeout(
+            dataSource.destroy(),
+            CONNECTION_CONFIG.destroyTimeout,
+            `[DB Reconnect] destroy() timed out after ${CONNECTION_CONFIG.destroyTimeout}ms`,
+          );
+        } catch (closeError: any) {
+          logger.warn('[DB Reconnect] Error closing connection:', closeError.message);
+          // The old destroy may still finish later and mutate its driver and
+          // isInitialized flag. Never initialize that same instance again.
+          dataSource = new DataSource({ ...dataSource.options });
+          appDataSource = dataSource;
         }
       }
-    }
 
-    // All retries exhausted
-    console.error(
-      `[DB Reconnect] Failed to reconnect after ${CONNECTION_CONFIG.maxConnectionRetries} attempts`,
-    );
-    lastHealthCheckError = lastError;
-  } finally {
-    reconnectionInProgress = false;
-  }
+      let lastError: Error | null = null;
+      for (let attempt = 1; attempt <= CONNECTION_CONFIG.maxConnectionRetries; attempt++) {
+        try {
+          logger.log(
+            `[DB Reconnect] Connection attempt ${attempt}/${CONNECTION_CONFIG.maxConnectionRetries}...`,
+          );
+
+          // Reconnect with skipSynchronize: schema DDL runs inside a
+          // transaction and can block on locks held by live traffic, leaving a
+          // connection stuck in `idle in transaction` and blocking pool
+          // teardown. The schema is already synchronized from startup (#1205).
+          await initializeWithGroupNameCheck(dataSource, { skipSynchronize: true });
+          registerPostgresVectorType(dataSource);
+          appDataSource = dataSource;
+
+          logger.log('[DB Reconnect] Successfully reconnected to database');
+          isHealthy = true;
+          lastHealthCheckError = null;
+          return dataSource;
+        } catch (error) {
+          lastError = error instanceof Error ? error : new Error(String(error));
+          logger.warn(`[DB Reconnect] Attempt ${attempt} failed: ${lastError.message}`);
+
+          if (dataSource.isInitialized) {
+            try {
+              await withTimeout(
+                dataSource.destroy(),
+                CONNECTION_CONFIG.destroyTimeout,
+                `[DB Reconnect] Cleanup destroy() timed out after ${CONNECTION_CONFIG.destroyTimeout}ms`,
+              );
+            } catch (destroyError: any) {
+              logger.warn(
+                '[DB Reconnect] Error cleaning up partially initialized connection:',
+                destroyError.message,
+              );
+              dataSource = new DataSource({ ...dataSource.options });
+              appDataSource = dataSource;
+            }
+          }
+
+          if (attempt < CONNECTION_CONFIG.maxConnectionRetries) {
+            const delay = CONNECTION_CONFIG.connectionRetryDelayMs * Math.pow(2, attempt - 1);
+            logger.log(`[DB Reconnect] Waiting ${delay}ms before next attempt...`);
+            await new Promise((resolve) => setTimeout(resolve, delay));
+          }
+        }
+      }
+
+      logger.error(
+        `[DB Reconnect] Failed to reconnect after ${CONNECTION_CONFIG.maxConnectionRetries} attempts`,
+      );
+      lastHealthCheckError = lastError;
+      throw lastError || new Error('Database reconnection failed');
+    } finally {
+      reconnectionInProgress = false;
+      reconnectionPromise = null;
+      initializationPromise = null;
+    }
+  })();
+
+  // Reuse the existing DataSource options. Resolving the URL through the
+  // database-backed system config is impossible while that database is down.
+  // Initialization callers must wait for the same reconnection attempt.
+  reconnectionPromise = promise;
+  initializationPromise = promise;
+
+  return promise;
 };
 
 // Close database connection
@@ -504,7 +633,7 @@ export const closeDatabase = async (): Promise<void> => {
 
   if (appDataSource && appDataSource.isInitialized) {
     await appDataSource.destroy();
-    console.log('Database connection closed.');
+    logger.log('Database connection closed.');
   }
   isHealthy = false;
 };

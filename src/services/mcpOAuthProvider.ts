@@ -22,10 +22,18 @@ import type {
 import { ServerConfig } from '../types/index.js';
 import { getSystemConfigDao } from '../dao/index.js';
 import {
+  buildRedirectUriFromBase,
+  DEFAULT_OAUTH_REDIRECT_URI,
+  getConfiguredRedirectUris,
+  resolvePreferredRedirectUris,
+} from '../utils/oauthRedirectUri.js';
+import { resolveInstallBaseUrl } from '../utils/installBaseUrl.js';
+import {
   initializeOAuthForServer,
   getRegisteredClient,
   removeRegisteredClient,
   fetchScopesFromServer,
+  createOAuthFetch,
 } from './oauthClientRegistration.js';
 import {
   clearOAuthData,
@@ -39,6 +47,10 @@ import {
 
 // Import getServerByName to access ServerInfo
 import { getServerByName } from './mcpService.js';
+import { logger } from '../utils/logger.js';
+
+type OAuthClientInformationWithAuthMethod = OAuthClientInformation &
+  Pick<OAuthClientMetadata, 'token_endpoint_auth_method'>;
 
 /**
  * MCPHub OAuth Provider for server-side OAuth flows
@@ -69,7 +81,7 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
   ): Promise<MCPHubOAuthProvider> {
     const systemConfigDao = getSystemConfigDao();
     const systemConfig = await systemConfigDao.get();
-    const systemInstallBaseUrl = systemConfig?.install?.baseUrl;
+    const systemInstallBaseUrl = resolveInstallBaseUrl(systemConfig);
     return new MCPHubOAuthProvider(serverName, serverConfig, systemInstallBaseUrl);
   }
 
@@ -77,52 +89,14 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
     return this._systemInstallBaseUrl;
   }
 
-  private sanitizeRedirectUri(input?: string): string | null {
-    if (!input) {
-      return null;
-    }
-
-    try {
-      const url = new URL(input);
-      url.searchParams.delete('server');
-      const params = url.searchParams.toString();
-      url.search = params ? `?${params}` : '';
-      return url.toString();
-    } catch {
-      return null;
-    }
-  }
-
-  private buildRedirectUriFromBase(baseUrl?: string): string | null {
-    if (!baseUrl) {
-      return null;
-    }
-
-    const trimmed = baseUrl.trim();
-    if (!trimmed) {
-      return null;
-    }
-
-    try {
-      const normalizedBase = trimmed.endsWith('/') ? trimmed : `${trimmed}/`;
-      const redirect = new URL('oauth/callback', normalizedBase);
-      return this.sanitizeRedirectUri(redirect.toString());
-    } catch {
-      return null;
-    }
-  }
-
   /**
    * Get redirect URL for OAuth callback
    */
   get redirectUrl(): string {
-    const dynamicConfig = this.serverConfig.oauth?.dynamicRegistration;
-    const metadata = dynamicConfig?.metadata || {};
-    const fallback = 'http://localhost:3000/oauth/callback';
-    const systemConfigured = this.buildRedirectUriFromBase(this.getSystemInstallBaseUrl());
-    const metadataConfigured = this.sanitizeRedirectUri(metadata.redirect_uris?.[0]);
-
-    return systemConfigured ?? metadataConfigured ?? fallback;
+    return (
+      resolvePreferredRedirectUris(this.serverConfig, this.getSystemInstallBaseUrl())[0] ??
+      DEFAULT_OAUTH_REDIRECT_URI
+    );
   }
 
   /**
@@ -134,28 +108,10 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
 
     // Use redirectUrl getter to ensure consistent callback URL
     const redirectUri = this.redirectUrl;
-    const systemConfigured = this.buildRedirectUriFromBase(this.getSystemInstallBaseUrl());
-    const metadataRedirects =
-      metadata.redirect_uris && metadata.redirect_uris.length > 0
-        ? metadata.redirect_uris
-            .map((uri) => this.sanitizeRedirectUri(uri))
-            .filter((uri): uri is string => Boolean(uri))
-        : [];
-    const redirectUris: string[] = [];
-
-    if (systemConfigured) {
-      redirectUris.push(systemConfigured);
-    }
-
-    for (const uri of metadataRedirects) {
-      if (!redirectUris.includes(uri)) {
-        redirectUris.push(uri);
-      }
-    }
-
-    if (!redirectUris.includes(redirectUri)) {
-      redirectUris.push(redirectUri);
-    }
+    const redirectUris = resolvePreferredRedirectUris(
+      this.serverConfig,
+      this.getSystemInstallBaseUrl(),
+    );
 
     const tokenEndpointAuthMethod =
       metadata.token_endpoint_auth_method && metadata.token_endpoint_auth_method !== ''
@@ -188,7 +144,10 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
     }
 
     try {
-      const scopes = await fetchScopesFromServer(serverUrl);
+      const scopes = await fetchScopesFromServer(
+        serverUrl,
+        await createOAuthFetch(this.serverConfig),
+      );
       if (scopes && scopes.length > 0) {
         const updatedConfig = await mutateOAuthSettings(this.serverName, ({ oauth }) => {
           oauth.scopes = scopes;
@@ -196,14 +155,14 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
         if (updatedConfig) {
           this.serverConfig = updatedConfig;
         }
-        console.log('Stored auto-detected OAuth scopes', {
+        logger.log('Stored auto-detected OAuth scopes', {
           serverName: this.serverName,
           scopes,
         });
         return scopes;
       }
     } catch (error) {
-      console.warn('Failed to auto-detect OAuth scopes', {
+      logger.warn('Failed to auto-detect OAuth scopes', {
         serverName: this.serverName,
         error,
       });
@@ -231,8 +190,13 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
   /**
    * Get previously registered client information
    */
-  clientInformation(): OAuthClientInformation | undefined {
+  clientInformation(): OAuthClientInformationWithAuthMethod | undefined {
     const clientInfo = getRegisteredClient(this.serverName);
+    // The SDK uses this hint when authorization-server metadata omits
+    // token_endpoint_auth_methods_supported. Keep it alongside credentials so
+    // refresh requests use the same authentication method that MCPHub selected
+    // for registration/static configuration.
+    const tokenEndpointAuthMethod = this.clientMetadata.token_endpoint_auth_method;
 
     if (!clientInfo) {
       // Try to use static client configuration from cached serverConfig
@@ -244,6 +208,7 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
         return {
           client_id: serverConfig.oauth.clientId,
           client_secret: serverConfig.oauth.clientSecret,
+          token_endpoint_auth_method: tokenEndpointAuthMethod,
         };
       }
       return undefined;
@@ -252,6 +217,7 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
     return {
       client_id: clientInfo.clientId,
       client_secret: clientInfo.clientSecret,
+      token_endpoint_auth_method: tokenEndpointAuthMethod,
     };
   }
 
@@ -260,7 +226,7 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
    * Called by SDK after successful dynamic registration
    */
   async saveClientInformation(info: OAuthClientInformationFull): Promise<void> {
-    console.log('Saving OAuth client information', { serverName: this.serverName });
+    logger.log('Saving OAuth client information', { serverName: this.serverName });
 
     const scopeString = info.scope?.trim();
     const scopes =
@@ -283,7 +249,7 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
         await this.ensureScopesFromServer();
       }
     } catch (error) {
-      console.error('Failed to persist OAuth client credentials', {
+      logger.error('Failed to persist OAuth client credentials', {
         serverName: this.serverName,
         error,
       });
@@ -327,7 +293,7 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
       return;
     }
 
-    console.log('Saving OAuth tokens', {
+    logger.log('Saving OAuth tokens', {
       serverName: this.serverName,
       hasAccessToken: Boolean(tokens.access_token),
       hasRefreshToken: Boolean(tokens.refresh_token),
@@ -351,7 +317,7 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
       serverInfo.oauth = undefined;
     }
 
-    console.log('Saved OAuth tokens', { serverName: this.serverName });
+    logger.log('Saved OAuth tokens', { serverName: this.serverName });
   }
 
   /**
@@ -360,10 +326,10 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
    * Instead, we store the URL in ServerInfo for the frontend to access
    */
   async redirectToAuthorization(url: URL): Promise<void> {
-    console.log('='.repeat(80));
-    console.log(`OAuth Authorization Required for server: ${this.serverName}`);
-    console.log(`Authorization URL: ${url.toString()}`);
-    console.log('='.repeat(80));
+    logger.log('='.repeat(80));
+    logger.log(`OAuth Authorization Required for server: ${this.serverName}`);
+    logger.log(`Authorization URL: ${url.toString()}`);
+    logger.log('='.repeat(80));
     let state = url.searchParams.get('state') || undefined;
 
     if (!state) {
@@ -390,7 +356,7 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
         this.serverConfig = updatedConfig;
       }
     } catch (error) {
-      console.error('Failed to persist pending OAuth authorization state', {
+      logger.error('Failed to persist pending OAuth authorization state', {
         serverName: this.serverName,
         error,
       });
@@ -403,13 +369,23 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
       serverInfo.oauth = {
         authorizationUrl,
         state,
-        codeVerifier: this._codeVerifier,
+        // codeVerifier is intentionally NOT stored on serverInfo.oauth: it is a
+        // PKCE credential, and storing it on the long-lived ServerInfo taints the
+        // whole object (CodeQL js/clear-text-logging), flagging every log that
+        // touches serverInfo.name. The verifier lives on this provider's private
+        // _codeVerifier and the DAO's pendingAuthorization.codeVerifier. See #1029.
+        // Flag when a static clientId is configured (which suppresses dynamic client
+        // registration). Such a client is registered on the provider with its own
+        // redirect URI allow-list, which frequently does NOT include this hub's callback,
+        // producing an "invalid redirect_uri" 400 at the provider's authorize endpoint.
+        // The frontend uses this to hint the user to remove clientId and let MCPHub self-register.
+        clientIdConfigured: Boolean(this.serverConfig?.oauth?.clientId),
       };
-      console.log('Stored OAuth authorization URL in server info', {
+      logger.log('Stored OAuth authorization URL in server info', {
         serverName: this.serverName,
       });
     } else {
-      console.warn('Server info not found while storing OAuth authorization URL', {
+      logger.warn('Server info not found while storing OAuth authorization URL', {
         serverName: this.serverName,
       });
     }
@@ -434,12 +410,12 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
         this.serverConfig = updatedConfig;
       }
     } catch (error) {
-      console.error('Failed to persist OAuth code verifier', {
+      logger.error('Failed to persist OAuth code verifier', {
         serverName: this.serverName,
         error,
       });
     }
-    console.log('Saved OAuth code verifier', { serverName: this.serverName });
+    logger.log('Saved OAuth code verifier', { serverName: this.serverName });
   }
 
   /**
@@ -494,7 +470,7 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
         const updated = await clearOAuthData(this.serverName, 'tokens');
         assignUpdatedConfig(updated);
         changed = true;
-        console.warn('Cleared OAuth tokens', { serverName: this.serverName });
+        logger.warn('Cleared OAuth tokens', { serverName: this.serverName });
       }
     }
 
@@ -509,7 +485,7 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
         const updated = await clearOAuthData(this.serverName, 'client');
         assignUpdatedConfig(updated);
         changed = true;
-        console.warn('Cleared OAuth client registration', { serverName: this.serverName });
+        logger.warn('Cleared OAuth client registration', { serverName: this.serverName });
       }
     }
 
@@ -559,18 +535,25 @@ const prepopulateScopesIfMissing = async (
       serverConfig.oauth.scopes = scopes;
 
       if (updatedConfig) {
-        console.log('Stored auto-detected OAuth scopes during provider initialization', {
+        logger.log('Stored auto-detected OAuth scopes during provider initialization', {
           serverName,
           scopes,
         });
       }
     }
   } catch (error) {
-    console.warn('Failed to auto-detect OAuth scopes during provider initialization', {
+    logger.warn('Failed to auto-detect OAuth scopes during provider initialization', {
       serverName,
       error,
     });
   }
+};
+
+const hasAuthorizationHeader = (headers?: Record<string, string>): boolean => {
+  if (!headers) {
+    return false;
+  }
+  return Object.keys(headers).some((key) => key.toLowerCase() === 'authorization');
 };
 
 /**
@@ -584,6 +567,30 @@ export const createOAuthProvider = async (
   serverName: string,
   serverConfig: ServerConfig,
 ): Promise<OAuthClientProvider | undefined> => {
+  const oauth = serverConfig.oauth;
+
+  // Create a provider when OAuth is explicitly configured, OR when the server
+  // has no static Authorization header. The SDK's StreamableHTTPClientTransport
+  // only intercepts a 401 OAuth challenge when an authProvider is attached, so a
+  // URL-only remote server needs a provider up front for 401-driven auto-discovery
+  // to run. A server whose auth is a static Authorization header / API key is left
+  // alone so that header is preserved verbatim (see #1013, #1045).
+  const hasOAuthConfig = Boolean(
+    oauth &&
+      (oauth.clientId ||
+        oauth.accessToken ||
+        oauth.refreshToken ||
+        oauth.authorizationEndpoint ||
+        oauth.tokenEndpoint ||
+        oauth.dynamicRegistration?.enabled ||
+        oauth.dynamicRegistration?.issuer ||
+        oauth.dynamicRegistration?.registrationEndpoint),
+  );
+
+  if (!hasOAuthConfig && hasAuthorizationHeader(serverConfig.headers)) {
+    return undefined;
+  }
+
   // Ensure scopes are pre-populated if dynamic registration already ran previously
   await prepopulateScopesIfMissing(serverName, serverConfig);
 
@@ -592,13 +599,13 @@ export const createOAuthProvider = async (
   try {
     await initializeOAuthForServer(serverName, serverConfig);
   } catch (error) {
-    console.warn('Failed to initialize OAuth for server', { serverName, error });
+    logger.warn('Failed to initialize OAuth for server', { serverName, error });
     // Continue anyway - the SDK might be able to handle it
   }
 
   // Create and return the provider using the factory method
   const provider = await MCPHubOAuthProvider.create(serverName, serverConfig);
 
-  console.log('Created OAuth provider', { serverName });
+  logger.log('Created OAuth provider', JSON.stringify({ serverName }));
   return provider;
 };

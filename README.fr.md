@@ -1,32 +1,75 @@
-# MCPHub : Le Hub Unifié pour les Serveurs MCP
+# MCPHub
+
+> Une passerelle et un plan de contrôle MCP open source et auto-hébergés pour connecter, contrôler et exploiter des serveurs MCP.
+
+[![CI](https://github.com/samanhappy/mcphub/actions/workflows/ci.yml/badge.svg)](https://github.com/samanhappy/mcphub/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/@samanhappy/mcphub)](https://www.npmjs.com/package/@samanhappy/mcphub)
+[![Docker pulls](https://img.shields.io/docker/pulls/samanhappy/mcphub)](https://hub.docker.com/r/samanhappy/mcphub)
+[![License](https://img.shields.io/github/license/samanhappy/mcphub)](LICENSE)
+[![Discord](https://img.shields.io/badge/discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/2BJehJZVH5)
+[![GitHub stars](https://img.shields.io/github/stars/samanhappy/mcphub?style=social)](https://github.com/samanhappy/mcphub/stargazers)
 
 [English](README.md) | Français | [中文版](README.zh.md)
 
-MCPHub facilite la gestion et la mise à l'échelle de plusieurs serveurs MCP (Model Context Protocol) en les organisant en points de terminaison HTTP streamables (SSE) flexibles, prenant en charge l'accès à tous les serveurs, à des serveurs individuels ou à des groupes de serveurs logiques.
+MCPHub offre une manière unifiée de connecter et de gérer plusieurs serveurs MCP, de les organiser en groupes, de contrôler les accès et d'exposer des points de terminaison MCP stables aux clients tels que Claude Code, Cursor, Cherry Studio, OpenWebUI et autres applications compatibles MCP.
 
-![Aperçu du tableau de bord](assets/dashboard.zh.png)
+![Aperçu du tableau de bord](assets/dashboard.fr.png)
 
 ## 🌐 Démo en direct et Documentation
 
+- **Site web** : [mcphub.app](https://www.mcphub.app/)
 - **Documentation** : [docs.mcphub.app](https://docs.mcphub.app/)
 - **Environnement de démo** : [demo.mcphub.app](https://demo.mcphub.app/)
 
 ## 🚀 Fonctionnalités
 
-- **Gestion centralisée** - Surveillez et contrôlez tous les serveurs MCP depuis un tableau de bord unifié
-- **Routage flexible** - Accédez à tous les serveurs, groupes spécifiques ou serveurs individuels via HTTP/SSE
-- **Routage intelligent** - Découverte d'outils propulsée par IA utilisant la recherche sémantique vectorielle ([En savoir plus](https://docs.mcphub.app/features/smart-routing))
+### Connecter une fois, exposer partout
+
+- **Routage intelligent** ⭐ - Découverte d'outils propulsée par IA utilisant la recherche sémantique vectorielle ([En savoir plus](https://docs.mcphub.app/features/smart-routing))
+- **Passerelle MCP unifiée** - Exposez tous les serveurs connectés via des points de terminaison MCP stables, avec des routes pour les groupes et les serveurs individuels
+- **Alias et routage des serveurs** - Définissez des alias et routez les clients vers tous les serveurs, des groupes, un serveur individuel ou le routage intelligent
+- **Prise en charge SSE / Streamable HTTP / stdio** - Connectez des serveurs MCP locaux et distants via les transports pris en charge
 - **Configuration à chaud** - Ajoutez, supprimez ou mettez à jour les serveurs sans temps d'arrêt
-- **Support OAuth 2.0** - Modes client et serveur pour une authentification sécurisée ([En savoir plus](https://docs.mcphub.app/features/oauth))
-- **Connexion Sociale** - Support de connexion GitHub et Google via Better Auth (nécessite le mode Base de données)
+
+### Contrôler les accès et les identifiants
+
+- **Identifiants personnels** ⭐ - Associez une clé par utilisateur à un serveur partagé, avec stockage chiffré et processus stdio isolés ([En savoir plus](docs/features/per-user-credentials.mdx))
+- **Authentification et contrôle d'accès** - Utilisez OAuth 2.0, des bearer keys et la visibilité des serveurs ou groupes pour gérer les accès
+- **Support OAuth 2.0** ⭐ - Modes client et serveur pour une authentification sécurisée ([En savoir plus](https://docs.mcphub.app/features/oauth))
+- **Connexion sociale** - Support de connexion GitHub et Google via Better Auth (nécessite le mode Base de données)
+- **Gestion des serveurs et des groupes** - Organisez les serveurs en groupes, gérez leur visibilité et contrôlez l'exposition des Tools, Prompts et Resources
+
+### Exploiter en confiance
+
+- **Journaux et observabilité** - Consultez l'activité des appels d'outils, l'état des requêtes, la latence et les journaux des serveurs
+- **Vérifications de santé** - Surveillez la santé des connexions et l'état des serveurs depuis un même endroit
+- **Tableau de bord Web** - Gérez la configuration et le fonctionnement des serveurs depuis un navigateur
+- **Compression des résultats d'outils** - Réduisez automatiquement les grands résultats texte avant qu'ils n'atteignent les clients
 - **Mode Base de données** - Stockez la configuration dans PostgreSQL pour les environnements de production ([En savoir plus](https://docs.mcphub.app/configuration/database-configuration))
 - **Prêt pour Docker** - Déployez instantanément avec la configuration conteneurisée
 
 ## 🔧 Démarrage rapide
 
+### Prérequis
+
+- **Docker** (recommandé) — le moyen le plus rapide d'exécuter MCPHub ; toutes les commandes ci-dessous l'utilisent
+- **Node.js** `^18.0.0 || >=20.0.0` et **pnpm** `10.12.4` — uniquement pour exécuter depuis les sources ou développer localement (voir [Développement local](#développement-local))
+
+### Démarrer avec Docker
+
+```bash
+docker run -p 3000:3000 -v ./data:/app/data samanhappy/mcphub
+```
+
+Ouvrez `http://localhost:3000` et connectez-vous avec le nom d'utilisateur `admin`. Au premier lancement, si la variable d'environnement `ADMIN_PASSWORD` n'est pas définie, un mot de passe aléatoire est généré et affiché dans les logs du serveur.
+
+La configuration, les utilisateurs et les identifiants persistent dans `./data` par défaut.
+
+Avec vos propres serveurs ? Avant le premier lancement, créez `data/mcp_settings.json` (voir [Configuration](#configuration)). Ensuite, ajoutez des serveurs dans le tableau de bord ou modifiez le fichier existant et redémarrez MCPHub.
+
 ### Configuration
 
-Créez un fichier `mcp_settings.json` :
+Avant le premier lancement, créez `data/mcp_settings.json` :
 
 ```json
 {
@@ -47,24 +90,27 @@ Créez un fichier `mcp_settings.json` :
 
 ### Déploiement avec Docker
 
-```bash
-# Exécutez avec une configuration personnalisée (recommandé)
-docker run -p 3000:3000 -v ./mcp_settings.json:/app/mcp_settings.json -v ./data:/app/data samanhappy/mcphub
+Voir [Démarrer avec Docker](#démarrer-avec-docker) pour la commande prête à copier. Gardez `./data` monté pour conserver la configuration, les utilisateurs et les identifiants après la recréation du conteneur.
 
-# Ou exécutez avec les paramètres par défaut
-docker run -p 3000:3000 samanhappy/mcphub
-```
+Deux variantes d'image sont publiées sous `samanhappy/mcphub` :
+
+- **`latest`** — l'image par défaut. Inclut Node.js/pnpm, Python, uv/uvx, Git et les outils de compilation. Couvre la plupart des serveurs MCP.
+- **`latest-full`** — l'image étendue. Ajoute la chaîne d'outils Rust (Cargo/rustc), Docker Engine, et les navigateurs Playwright (Chrome + Firefox, amd64 uniquement). À utiliser pour les serveurs Rust ou les workflows conteneur-dans-conteneur. Téléchargement plus volumineux.
+
+Voir [Configuration Docker](https://docs.mcphub.app/configuration/docker-setup) pour les options de build et la configuration Docker-in-Docker.
 
 ### Accéder au tableau de bord
 
-Ouvrez `http://localhost:3000` et connectez-vous avec le nom d'utilisateur `admin`. Au premier lancement, si la variable d'environnement `ADMIN_PASSWORD` n'est pas définie, un mot de passe aléatoire est généré et affiché dans les logs du serveur. Vous pouvez également prédéfinir le mot de passe :
+Ouvrez `http://localhost:3000` (voir [Démarrer avec Docker](#démarrer-avec-docker) pour la connexion). Vous pouvez également prédéfinir le mot de passe :
 
 ```bash
 # Docker : définir le mot de passe admin via une variable d'environnement
-docker run -p 3000:3000 -e ADMIN_PASSWORD=your-secure-password samanhappy/mcphub
+docker run -p 3000:3000 -v ./data:/app/data -e ADMIN_PASSWORD=your-secure-password samanhappy/mcphub
 ```
 
 > **Conseil :** Changez le mot de passe admin après la première connexion pour plus de sécurité.
+
+> **Mode headless :** définissez `DISABLE_WEB=true` pour ne plus servir l'interface web intégrée et exécuter MCPHub uniquement avec le backend/API et les endpoints MCP. C'est utile si vous gérez directement les serveurs via `mcp_settings.json`.
 
 ### Connecter les clients IA
 
@@ -91,6 +137,7 @@ http://localhost:3000/mcp/$smart/{group}  # Routage intelligent dans un groupe
 | [Mode Base de données](https://docs.mcphub.app/configuration/database-configuration) | Configuration PostgreSQL pour la production |
 | [OAuth](https://docs.mcphub.app/features/oauth)                                      | Configuration client et serveur OAuth 2.0   |
 | [Routage intelligent](https://docs.mcphub.app/features/smart-routing)                | Découverte d'outils propulsée par IA        |
+| [Guide CLI](https://docs.mcphub.app/features/cli)                                 | Gérer et appeler le hub depuis un terminal  |
 | [Configuration Docker](https://docs.mcphub.app/configuration/docker-setup)           | Guide de déploiement Docker                 |
 
 ## 🧑‍💻 Développement local
@@ -102,28 +149,33 @@ pnpm install
 pnpm dev
 ```
 
+Le développement local utilise `admin` / `admin123` et stocke sa copie de configuration modifiable dans `data/mcp_settings.dev.json`, afin que le `mcp_settings.json` du dépôt reste sans identifiants par défaut.
+
 > Pour les utilisateurs Windows, démarrez le backend et le frontend séparément : `pnpm backend:dev`, `pnpm frontend:dev`
 
 📖 Consultez le [Guide de développement](https://docs.mcphub.app/development) pour les instructions de configuration détaillées.
 
 ## 🔍 Stack technique
 
-- **Backend** : Node.js, Express, TypeScript
+- **Backend** : Node.js, Express, TypeScript (ESM)
 - **Frontend** : React, Vite, Tailwind CSS
-- **Authentification** : JWT & bcrypt
+- **Stockage** : `mcp_settings.json` (par défaut) ; PostgreSQL via TypeORM avec pgvector pour le Smart Routing
+- **Authentification** : JWT + bcrypt pour les comptes locaux ; bearer keys ; serveur OAuth 2.0 intégré (`@node-oauth/oauth2-server`) ; Better Auth optionnel pour GitHub/Google
 - **Protocole** : Model Context Protocol SDK
 
 ## 👥 Contribuer
 
-Les contributions sont les bienvenues ! Rejoignez notre [communauté Discord](https://discord.gg/qMKNsn5Q) pour des discussions et du support.
+Les contributions sont les bienvenues ! Rejoignez notre [communauté Discord](https://discord.gg/2BJehJZVH5) pour des discussions et du support.
 
 ## ❤️ Sponsor
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/samanhappy)
 
+Les utilisateurs en Chine peuvent aussi soutenir via WeChat Pay — voir [中文版](README.zh.md).
+
 ## 🌟 Historique des étoiles
 
-[![Historique des étoiles](https://api.star-history.com/svg?repos=samanhappy/mcphub&type=Date)](https://www.star-history.com/#samanhappy/mcphub&Date)
+[![Historique des étoiles](https://star-history.dera.page/svg?repos=samanhappy/mcphub&type=Date)](https://star-history.dera.page/#samanhappy/mcphub&Date)
 
 ## 📄 Licence
 

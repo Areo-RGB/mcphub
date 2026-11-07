@@ -2,6 +2,10 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useUserData } from '@/hooks/useUserData';
 import { User, UserUpdateData } from '@/types';
+import {
+  validatePasswordStrength,
+  mapBackendPasswordErrors,
+} from '../utils/passwordValidation';
 
 interface EditUserFormProps {
   user: User;
@@ -13,10 +17,12 @@ const EditUserForm = ({ user, onEdit, onCancel }: EditUserFormProps) => {
   const { t } = useTranslation();
   const { updateUser } = useUserData();
   const [error, setError] = useState<string | null>(null);
+  const [passwordErrors, setPasswordErrors] = useState<string[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const [formData, setFormData] = useState({
     isAdmin: user.isAdmin,
+    email: user.email || '',
     newPassword: '',
     confirmPassword: '',
   });
@@ -24,6 +30,7 @@ const EditUserForm = ({ user, onEdit, onCancel }: EditUserFormProps) => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setPasswordErrors([]);
 
     // Validate passwords match if changing password
     if (formData.newPassword && formData.newPassword !== formData.confirmPassword) {
@@ -31,9 +38,13 @@ const EditUserForm = ({ user, onEdit, onCancel }: EditUserFormProps) => {
       return;
     }
 
-    if (formData.newPassword && formData.newPassword.length < 6) {
-      setError(t('users.passwordTooShort'));
-      return;
+    if (formData.newPassword) {
+      const validation = validatePasswordStrength(formData.newPassword);
+      if (!validation.isValid) {
+        setError(t('auth.passwordStrengthError'));
+        setPasswordErrors(validation.errors.map((key) => t(`auth.${key}`)));
+        return;
+      }
     }
 
     setIsSubmitting(true);
@@ -41,6 +52,7 @@ const EditUserForm = ({ user, onEdit, onCancel }: EditUserFormProps) => {
     try {
       const updateData: UserUpdateData = {
         isAdmin: formData.isAdmin,
+        email: formData.email,
       };
 
       if (formData.newPassword) {
@@ -50,6 +62,9 @@ const EditUserForm = ({ user, onEdit, onCancel }: EditUserFormProps) => {
       const result = await updateUser(user.username, updateData);
       if (result?.success) {
         onEdit();
+      } else if (result?.errors?.length) {
+        setError(result.message || t('auth.passwordStrengthError'));
+        setPasswordErrors(mapBackendPasswordErrors(result.errors).map((key) => t(key)));
       } else {
         setError(result?.message || t('users.updateError'));
       }
@@ -70,7 +85,7 @@ const EditUserForm = ({ user, onEdit, onCancel }: EditUserFormProps) => {
 
   return (
     <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-      <div className="bg-white p-8 rounded-xl shadow-2xl max-w-md w-full mx-4 border border-gray-100">
+      <div className="bg-white dark:bg-gray-800 p-8 rounded-xl shadow-2xl max-w-md w-full mx-4 border border-gray-100 dark:border-gray-700">
         <form onSubmit={handleSubmit}>
           <h2 className="text-xl font-bold text-gray-900 mb-6">
             {t('users.edit')} - <span className="text-blue-600">{user.username}</span>
@@ -79,6 +94,13 @@ const EditUserForm = ({ user, onEdit, onCancel }: EditUserFormProps) => {
           {error && (
             <div className="bg-red-50 border-l-4 border-red-500 text-red-700 p-4 mb-6 rounded-md">
               <p className="text-sm font-medium">{error}</p>
+              {passwordErrors.length > 0 && (
+                <ul className="list-disc list-inside mt-2 space-y-1 text-sm">
+                  {passwordErrors.map((message) => (
+                    <li key={message}>{message}</li>
+                  ))}
+                </ul>
+              )}
             </div>
           )}
 
@@ -101,7 +123,23 @@ const EditUserForm = ({ user, onEdit, onCancel }: EditUserFormProps) => {
               </label>
             </div>
 
-            <div className="border-t border-gray-100 pt-4 mt-2">
+            <div>
+              <label htmlFor="email" className="block text-sm font-medium text-gray-700 mb-1">
+                {t('users.email')}
+              </label>
+              <input
+                type="email"
+                id="email"
+                name="email"
+                value={formData.email}
+                onChange={handleInputChange}
+                placeholder={t('users.emailPlaceholder')}
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent form-input transition-all duration-200"
+                disabled={isSubmitting}
+              />
+            </div>
+
+            <div className="border-t border-gray-100 dark:border-gray-700 pt-4 mt-2">
               <p className="text-xs text-gray-500 uppercase font-semibold tracking-wider mb-3">
                 {t('users.changePassword')}
               </p>
@@ -123,8 +161,11 @@ const EditUserForm = ({ user, onEdit, onCancel }: EditUserFormProps) => {
                     placeholder={t('users.newPasswordPlaceholder')}
                     className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent form-input transition-all duration-200"
                     disabled={isSubmitting}
-                    minLength={6}
+                    minLength={8}
                   />
+                  <p className="mt-1 text-xs text-gray-500">
+                    {t('auth.passwordStrengthHint')}
+                  </p>
                 </div>
 
                 {formData.newPassword && (
@@ -144,7 +185,7 @@ const EditUserForm = ({ user, onEdit, onCancel }: EditUserFormProps) => {
                       placeholder={t('users.confirmPasswordPlaceholder')}
                       className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent form-input transition-all duration-200"
                       disabled={isSubmitting}
-                      minLength={6}
+                      minLength={8}
                     />
                   </div>
                 )}
@@ -152,18 +193,18 @@ const EditUserForm = ({ user, onEdit, onCancel }: EditUserFormProps) => {
             </div>
           </div>
 
-          <div className="flex justify-end space-x-3 mt-8">
+          <div className="flex justify-end space-x-2 mt-6">
             <button
               type="button"
               onClick={onCancel}
-              className="px-5 py-2.5 text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 transition-all duration-200 font-medium btn-secondary shadow-sm"
+              className="hub-btn"
               disabled={isSubmitting}
             >
               {t('common.cancel')}
             </button>
             <button
               type="submit"
-              className="px-5 py-2.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-all duration-200 font-medium btn-primary shadow-md disabled:opacity-70 disabled:cursor-not-allowed flex items-center"
+              className="hub-btn primary"
               disabled={isSubmitting}
             >
               {isSubmitting && (

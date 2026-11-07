@@ -1,3 +1,6 @@
+import { deleteCredentialBindings } from '../services/credentialBindingService.js';
+import { CredentialBindingError } from '../utils/credentialTemplate.js';
+import { isDeepStrictEqual } from 'node:util';
 import { Request, Response } from 'express';
 import {
   ApiResponse,
@@ -14,22 +17,138 @@ import {
   addServer,
   addOrUpdateServer,
   removeServer,
+  closeServer,
   getServerByName,
   notifyToolChanged,
+  broadcastToolListChanged,
+  broadcastPromptListChanged,
+  broadcastResourceListChanged,
   syncToolEmbedding,
   toggleServerStatus,
   reconnectServer,
+  reinstallServer,
+  updateServerInfoVisibility,
 } from '../services/mcpService.js';
-import { loadSettings } from '../config/index.js';
-import { syncAllServerToolsEmbeddings } from '../services/vectorSearchService.js';
+import { clearAllCaches } from '../utils/cacheUtils.js';
+import {
+  removeServerToolEmbeddings,
+  syncAllServerToolsEmbeddings,
+} from '../services/vectorSearchService.js';
 import { createSafeJSON } from '../utils/serialization.js';
 import { cloneDefaultOAuthServerConfig } from '../constants/oauthServerDefaults.js';
-import { getServerDao, getGroupDao, getSystemConfigDao } from '../dao/DaoFactory.js';
-import { getBearerKeyDao } from '../dao/DaoFactory.js';
+import {
+  getBearerKeyDao,
+  getGroupDao,
+  getOAuthClientDao,
+  getOAuthTokenDao,
+  getServerDao,
+  getSystemConfigDao,
+  getUserConfigDao,
+  getUserDao,
+} from '../dao/DaoFactory.js';
+import { migrateLegacySmartRoutingConfig } from '../dao/SystemConfigDao.js';
 import { UserContextService } from '../services/userContextService.js';
+import { authorizationService } from '../services/authorizationService.js';
+import {
+  presentServerForPrincipal,
+  presentServerInfoForPrincipal,
+} from '../services/serverConfigPresenter.js';
+import { disconnectUpstreamOAuth } from '../services/upstreamOAuthDisconnectService.js';
+import type { UpstreamOAuthDisconnectScope } from '../services/upstreamOAuthDisconnectService.js';
 import { normalizeServerConfigForPersistence } from '../utils/serverConfigPersistence.js';
+import { isPrivilegedServerConfig } from '../utils/serverConfigValidation.js';
+import { validateServerName } from '../utils/serverNameValidation.js';
+import { setCachedSystemConfig } from '../utils/systemConfigCache.js';
+import { DEFAULT_INSTALL_BASE_URL, withResolvedInstallBaseUrl } from '../utils/installBaseUrl.js';
+import { getSmartRoutingConfig, parseBooleanEnvVar } from '../utils/smartRouting.js';
+import { previewOpenApiToolStats } from '../services/openApiToolStatsService.js';
+import { logger } from '../utils/logger.js';
 
 type DescribableConfig = Record<string, { enabled: boolean; description?: string }>;
+type ServerRecord = ServerConfig & { name: string };
+
+type RequestUser = {
+  username: string;
+  isAdmin?: boolean;
+};
+
+const getRequestUser = (req: Request): RequestUser | null => {
+  return ((req as any).user as RequestUser | undefined) || null;
+};
+
+const canAccessServer = (user: RequestUser | null, server: ServerRecord): boolean => {
+  if (!user) {
+    return false;
+  }
+
+  if (user.isAdmin) {
+    return true;
+  }
+
+  return server.owner === user.username;
+};
+
+const loadAuthorizedServer = async (
+  req: Request,
+  res: Response,
+  serverName: string,
+): Promise<ServerRecord | null> => {
+  const serverDao = getServerDao();
+  const server = await serverDao.findById(serverName);
+
+  if (!server) {
+    res.status(404).json({
+      success: false,
+      message: 'Server not found',
+    });
+    return null;
+  }
+
+  if (!canAccessServer(getRequestUser(req), server)) {
+    res.status(403).json({
+      success: false,
+      message: 'Forbidden',
+    });
+    return null;
+  }
+
+  return server;
+};
+
+const ensureNonAdminCanManageConfig = (
+  req: Request,
+  res: Response,
+  config: ServerConfig,
+): boolean => {
+  const currentUser = getRequestUser(req);
+  if (currentUser?.isAdmin) {
+    return true;
+  }
+
+  if (isPrivilegedServerConfig(config)) {
+    res.status(403).json({
+      success: false,
+      message: 'Only admins can create or modify stdio-based servers',
+    });
+    return false;
+  }
+
+  return true;
+};
+
+const assignServerOwner = (req: Request, config: ServerConfig, existingOwner?: string): void => {
+  const currentUser = getRequestUser(req);
+  if (!currentUser) {
+    return;
+  }
+
+  if (currentUser.isAdmin) {
+    config.owner = config.owner || existingOwner || currentUser.username;
+    return;
+  }
+
+  config.owner = currentUser.username;
+};
 
 const clearDescriptionOverride = (
   items: DescribableConfig,
@@ -52,6 +171,87 @@ const clearDescriptionOverride = (
 
   return nextItems;
 };
+
+const stripUndefinedDeep = (value: unknown): unknown => {
+  if (Array.isArray(value)) {
+    return value.map((item) => stripUndefinedDeep(item));
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, nestedValue]) => nestedValue !== undefined)
+        .map(([key, nestedValue]) => [key, stripUndefinedDeep(nestedValue)]),
+    );
+  }
+
+  return value;
+};
+
+// Fields baked into the live MCP client/transport at connect time. Editing any
+// of these requires tearing down and re-establishing the runtime. Everything
+// else in ServerConfig (description, owner, visibility, sharedWithUsers,
+// `enabled`, and the tools/prompts/resources per-item overrides) is read-time
+// or access metadata that can be applied without a reconnect.
+const CONNECTION_RELEVANT_CONFIG_FIELDS = [
+  'type',
+  'url',
+  'command',
+  'args',
+  'env',
+  'headers',
+  'passthroughHeaders',
+  'options',
+  'oauth',
+  'openapi',
+  'perSessionClient',
+  'credentialTemplate',
+  'startOnDemand',
+  'idleTimeoutMs',
+  'enableKeepAlive',
+  'keepAliveInterval',
+  'proxy',
+] as const;
+
+type ConnectionRelevantServerConfig = Pick<
+  ServerConfig,
+  (typeof CONNECTION_RELEVANT_CONFIG_FIELDS)[number]
+>;
+
+const toConnectionRelevantConfig = (
+  config: ServerConfig | ServerRecord,
+): ConnectionRelevantServerConfig => {
+  const normalized = normalizeServerConfigForPersistence(config) as Record<string, unknown>;
+  const picked: Record<string, unknown> = {};
+  for (const field of CONNECTION_RELEVANT_CONFIG_FIELDS) {
+    picked[field] = normalized[field];
+  }
+  const comparable = stripUndefinedDeep(picked) as Record<string, unknown>;
+  // Treat the default request timeout (60000, the dashboard form default) as
+  // equivalent to "not set": an explicit 60000 stored via API/file import and an
+  // absent timeout resolve to the same effective connect timeout. Without this, a
+  // stored explicit 60000 (or the dashboard echoing 60000 back) would look like a
+  // connection change on unrelated edits and reload the runtime for nothing.
+  const options = comparable.options as { timeout?: number } | undefined;
+  if (options && options.timeout === 60000) {
+    delete options.timeout;
+    if (Object.keys(options).length === 0) {
+      delete comparable.options;
+    }
+  }
+  return comparable as ConnectionRelevantServerConfig;
+};
+
+// True when an edit touches at least one field the live connection depends on,
+// i.e. the runtime must be torn down and reconnected.
+const hasConnectionRelevantChange = (
+  existingServer: ServerRecord,
+  nextConfig: ServerConfig,
+): boolean =>
+  !isDeepStrictEqual(
+    toConnectionRelevantConfig(existingServer),
+    toConnectionRelevantConfig(nextConfig),
+  );
 
 export const getAllServers = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -82,6 +282,7 @@ export const getAllServers = async (req: Request, res: Response): Promise<void> 
 
     // Get servers info with pagination if limit is specified
     let serversInfo: Omit<ServerInfo, 'client' | 'transport'>[];
+    let allServers: Omit<ServerInfo, 'client' | 'transport'>[] | undefined;
     let pagination = undefined;
 
     if (limit !== undefined) {
@@ -89,10 +290,11 @@ export const getAllServers = async (req: Request, res: Response): Promise<void> 
       const serverDao = getServerDao();
       const paginatedResult = isAdmin
         ? await serverDao.findAllPaginated(page, limit)
-        : await serverDao.findByOwnerPaginated(currentUser!.username, page, limit);
+        : await serverDao.findVisibleToUserPaginated(currentUser!.username, page, limit);
 
       // Get runtime info for paginated servers
       serversInfo = await getServersInfo(page, limit, currentUser);
+      allServers = await getServersInfo(undefined, undefined, currentUser);
 
       pagination = {
         page: paginatedResult.page,
@@ -107,14 +309,28 @@ export const getAllServers = async (req: Request, res: Response): Promise<void> 
       serversInfo = await getServersInfo();
     }
 
-    const response: ApiResponse = {
+    // #1036 Phase 1: withhold OAuth session-recovery fields from principals
+    // who may not read the full server configuration (defense in depth; the
+    // config block on list entries is already narrowed to safe metadata).
+    const presentedServersInfo = serversInfo.map((info) =>
+      presentServerInfoForPrincipal(info, currentUser),
+    );
+    const presentedAllServers = allServers?.map((info) =>
+      presentServerInfoForPrincipal(info, currentUser),
+    );
+
+    const response: ApiResponse & {
+      pagination?: typeof pagination;
+      allServers?: Omit<ServerInfo, 'client' | 'transport'>[];
+    } = {
       success: true,
-      data: createSafeJSON(serversInfo),
+      data: createSafeJSON(presentedServersInfo),
+      ...(presentedAllServers && { allServers: createSafeJSON(presentedAllServers) }),
       ...(pagination && { pagination }),
     };
     res.json(response);
   } catch (error) {
-    console.error('Failed to get servers information:', error);
+    logger.error('Failed to get servers information:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to get servers information',
@@ -122,14 +338,54 @@ export const getAllServers = async (req: Request, res: Response): Promise<void> 
   }
 };
 
-export const getAllSettings = async (_: Request, res: Response): Promise<void> => {
+export const getServerShareCandidates = async (req: Request, res: Response): Promise<void> => {
   try {
-    // Get base settings from file (for OAuth clients, tokens, users, etc.)
-    const fileSettings = loadSettings();
+    const { name } = req.params;
+    const server = await loadAuthorizedServer(req, res, name);
+    if (!server) {
+      return;
+    }
 
-    // Get servers from DAO (supports both file and database modes)
-    const serverDao = getServerDao();
-    const servers = await serverDao.findAll();
+    const users = await getUserDao().findAll();
+    // Treat a missing/empty owner as 'admin' so the candidate list is
+    // consistent before and after the first edit (which assigns the owner).
+    const effectiveOwner = server.owner?.trim() || 'admin';
+    const usernames = users
+      .map((user) => user.username)
+      .filter((username) => username !== effectiveOwner)
+      .sort((left, right) => left.localeCompare(right));
+
+    res.json({ success: true, data: usernames });
+  } catch (error) {
+    logger.error('Failed to get server share candidates:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to get server share candidates',
+    });
+  }
+};
+
+export const getAllSettings = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const [
+      servers,
+      users,
+      groups,
+      systemConfigResult,
+      userConfigs,
+      oauthClients,
+      oauthTokens,
+      bearerKeys,
+    ] = await Promise.all([
+      getServerDao().findAll(),
+      getUserDao().findAll(),
+      getGroupDao().findAll(),
+      getSystemConfigDao().get(),
+      getUserConfigDao().getAll(),
+      getOAuthClientDao().findAll(),
+      getOAuthTokenDao().findAll(),
+      getBearerKeyDao().findAll(),
+    ]);
 
     // Convert servers array to mcpServers map format
     const mcpServers: McpSettings['mcpServers'] = {};
@@ -138,48 +394,116 @@ export const getAllSettings = async (_: Request, res: Response): Promise<void> =
       mcpServers[name] = config;
     }
 
-    // Get groups from DAO
-    const groupDao = getGroupDao();
-    const groups = await groupDao.findAll();
-
-    // Get system config from DAO
-    const systemConfigDao = getSystemConfigDao();
-    const systemConfig = await systemConfigDao.get();
+    const systemConfig = systemConfigResult || {};
 
     // Ensure smart routing config has DB URL set if environment variable is present
     const dbUrlEnv = process.env.DB_URL || '';
+    // Runtime enablement (getSmartRoutingConfig) always lets SMART_ROUTING_ENABLED /
+    // ENABLE_SMART_ROUTING override the stored setting — the dashboard must reflect
+    // that same precedence, or an env-only deployment (our own Docker quick start)
+    // shows "Inactive" here while smart routing is actually live end-to-end.
+    // Mirrors getConfigValue's own precedence: try each var in order, skipping
+    // unset/blank ones — an empty string must fall through to the next
+    // candidate (and ultimately the DB value) rather than being parsed as
+    // "false", or SMART_ROUTING_ENABLED="" would silently override a DB `true`.
+    const smartRoutingEnabledRaw = [
+      process.env.SMART_ROUTING_ENABLED,
+      process.env.ENABLE_SMART_ROUTING,
+    ].find((raw) => raw !== undefined && raw.trim() !== '');
+    const smartRoutingEnabledFromEnv =
+      smartRoutingEnabledRaw !== undefined ? parseBooleanEnvVar(smartRoutingEnabledRaw) : undefined;
     if (!systemConfig.smartRouting) {
       systemConfig.smartRouting = {
-        enabled: false,
+        enabled: smartRoutingEnabledFromEnv ?? false,
         dbUrl: dbUrlEnv ? '${DB_URL}' : '',
-        openaiApiBaseUrl: '',
-        openaiApiKey: '',
-        openaiApiEmbeddingModel: '',
+        llmProviderBaseUrl: '',
+        llmProviderApiKey: '',
+        embeddingModel: '',
       };
-    } else if (!systemConfig.smartRouting.dbUrl) {
-      systemConfig.smartRouting.dbUrl = dbUrlEnv ? '${DB_URL}' : '';
+    } else {
+      if (smartRoutingEnabledFromEnv !== undefined) {
+        systemConfig.smartRouting.enabled = smartRoutingEnabledFromEnv;
+      }
+      if (!systemConfig.smartRouting.dbUrl) {
+        systemConfig.smartRouting.dbUrl = dbUrlEnv ? '${DB_URL}' : '';
+      }
     }
 
-    // Get bearer auth keys from DAO
-    const bearerKeyDao = getBearerKeyDao();
-    const bearerKeys = await bearerKeyDao.findAll();
+    // Same idea one level down (issue #642): an env var silently outranks the
+    // value the user typed into the dashboard — e.g. a stale OPENAI_API_KEY in
+    // .env shadows a freshly pasted valid key, and embeddings fail with 401 while
+    // the form happily shows the new key. Reuse getSmartRoutingConfig() so the
+    // field→env-var mapping lives in exactly one place instead of being repeated
+    // here; this endpoint is admin-only and low-traffic, so the extra DAO read is
+    // not worth optimising away.
+    const smartRoutingEnvOverriddenFields =
+      (await getSmartRoutingConfig()).envOverriddenFields ?? [];
 
-    // Merge all data into settings object
+    if (!systemConfig.toolResultCompression) {
+      systemConfig.toolResultCompression = {
+        enabled: false,
+        minTokens: 2000,
+        maxOutputTokens: 1200,
+        strategy: 'auto',
+      };
+    }
+
+    const systemConfigForResponse = withResolvedInstallBaseUrl(
+      {
+        ...systemConfig,
+        // Response-only copy: `envOverriddenFields` is display metadata, not part
+        // of the persisted schema. The file-backed DAO returns its cached settings
+        // object by reference, so attaching the field to systemConfig.smartRouting
+        // directly would leak it into mcp_settings.json on the next write.
+        ...(systemConfig.smartRouting
+          ? {
+              smartRouting: {
+                ...systemConfig.smartRouting,
+                envOverriddenFields: smartRoutingEnvOverriddenFields,
+              },
+            }
+          : {}),
+      },
+      DEFAULT_INSTALL_BASE_URL,
+    );
+
     const settings: McpSettings = {
-      ...fileSettings,
+      users,
       mcpServers,
       groups,
-      systemConfig,
-      bearerKeys,
+      systemConfig: systemConfigForResponse,
+      userConfigs,
+      oauthClients,
+      oauthTokens,
+      bearerKeys: bearerKeys.map((key) => ({
+        ...key,
+        kind: key.kind ?? 'system',
+        token:
+          key.token.length > 12 ? `${key.token.slice(0, 8)}...${key.token.slice(-4)}` : '********',
+      })),
     };
 
     const response: ApiResponse = {
       success: true,
-      data: createSafeJSON(settings),
+      data: createSafeJSON(
+        (req as any).user?.isAdmin
+          ? settings
+          : {
+              mcpServers: {},
+              systemConfig: {
+                install: {
+                  baseUrl: systemConfigForResponse.install?.baseUrl,
+                },
+              },
+              bearerKeys: settings.bearerKeys?.filter(
+                (key) => key.kind === 'user' && key.owner === getRequestUser(req)?.username,
+              ),
+            },
+      ),
     };
     res.json(response);
   } catch (error) {
-    console.error('Failed to get server settings:', error);
+    logger.error('Failed to get server settings:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to get server settings',
@@ -187,16 +511,64 @@ export const getAllSettings = async (_: Request, res: Response): Promise<void> =
   }
 };
 
-export const createServer = async (req: Request, res: Response): Promise<void> => {
+/**
+ * Preview the tool list an OpenAPI import would generate, without persisting
+ * anything (#1082). Large specs can silently produce a tools/list that does
+ * not fit in a model's context window; this endpoint lets the form surface
+ * the numbers at the point of confirming the import.
+ */
+export const previewOpenApiToolStatsHandler = async (
+  req: Request,
+  res: Response,
+): Promise<void> => {
   try {
-    const { name, config } = req.body as AddServerRequest;
-    if (!name || typeof name !== 'string') {
+    const { config } = req.body as AddServerRequest;
+    if (!config || typeof config !== 'object') {
       res.status(400).json({
         success: false,
-        message: 'Server name is required',
+        message: 'Server configuration is required',
       });
       return;
     }
+
+    const normalizedConfig = normalizeServerConfigForPersistence(config);
+
+    if (!normalizedConfig.openapi?.url && !normalizedConfig.openapi?.schema) {
+      res.status(400).json({
+        success: false,
+        message: 'OpenAPI specification URL or schema is required',
+      });
+      return;
+    }
+
+    // Assign the requesting user as owner so initialize()'s admin check (and
+    // therefore the internal-network SSRF allowance) matches what a real
+    // add-server request would produce for the same caller.
+    assignServerOwner(req, normalizedConfig);
+
+    const stats = await previewOpenApiToolStats(normalizedConfig);
+    res.json({ success: true, data: stats });
+  } catch (error) {
+    logger.warn('Failed to preview OpenAPI tool stats:', error);
+    res.status(400).json({
+      success: false,
+      message: error instanceof Error ? error.message : 'Failed to analyze OpenAPI specification',
+    });
+  }
+};
+
+export const createServer = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { name, config } = req.body as AddServerRequest;
+    const nameValidation = validateServerName(name);
+    if (!nameValidation.valid) {
+      res.status(400).json({
+        success: false,
+        message: nameValidation.message,
+      });
+      return;
+    }
+    const serverName = nameValidation.normalized as string;
 
     if (!config || typeof config !== 'object') {
       res.status(400).json({
@@ -212,12 +584,12 @@ export const createServer = async (req: Request, res: Response): Promise<void> =
       !normalizedConfig.url &&
       !normalizedConfig.openapi?.url &&
       !normalizedConfig.openapi?.schema &&
-      (!normalizedConfig.command || !normalizedConfig.args)
+      !normalizedConfig.command
     ) {
       res.status(400).json({
         success: false,
         message:
-          'Server configuration must include either a URL, OpenAPI specification URL or schema, or command with arguments',
+          'Server configuration must include either a URL, OpenAPI specification URL or schema, or command',
       });
       return;
     }
@@ -277,29 +649,28 @@ export const createServer = async (req: Request, res: Response): Promise<void> =
       return;
     }
 
+    if (!ensureNonAdminCanManageConfig(req, res, normalizedConfig)) {
+      return;
+    }
+
     // Set default keep-alive interval for SSE servers if not specified
     if (
-      (normalizedConfig.type === 'sse' ||
-        (!normalizedConfig.type && normalizedConfig.url)) &&
+      (normalizedConfig.type === 'sse' || (!normalizedConfig.type && normalizedConfig.url)) &&
       !normalizedConfig.keepAliveInterval
     ) {
       normalizedConfig.keepAliveInterval = 60000; // Default 60 seconds for SSE servers
     }
 
-    // Set owner property - use current user's username, default to 'admin'
-    if (!normalizedConfig.owner) {
-      const currentUser = (req as any).user;
-      normalizedConfig.owner = currentUser?.username || 'admin';
-    }
+    assignServerOwner(req, normalizedConfig);
 
-    const result = await addServer(name, normalizedConfig);
+    const result = await addServer(serverName, normalizedConfig);
     if (result.success) {
       res.json({
         success: true,
         message: 'Server added successfully',
       });
-      notifyToolChanged(name, { reportEmbeddingProgress: true }).catch((error) => {
-        console.error('Failed to trigger embedding sync for created server:', error);
+      notifyToolChanged(serverName, { reportEmbeddingProgress: true }).catch((error) => {
+        logger.error('Failed to trigger embedding sync for created server:', error);
       });
     } else {
       res.status(400).json({
@@ -308,9 +679,9 @@ export const createServer = async (req: Request, res: Response): Promise<void> =
       });
     }
   } catch (error) {
-    res.status(500).json({
+    res.status(error instanceof CredentialBindingError ? 400 : 500).json({
       success: false,
-      message: 'Internal server error',
+      message: error instanceof CredentialBindingError ? error.message : 'Internal server error',
     });
   }
 };
@@ -341,9 +712,10 @@ export const batchCreateServers = async (req: Request, res: Response): Promise<v
     const validateServerConfig = (
       name: string,
       config: ServerConfig,
-    ): { valid: boolean; message?: string } => {
-      if (!name || typeof name !== 'string') {
-        return { valid: false, message: 'Server name is required and must be a string' };
+    ): { valid: boolean; message?: string; normalizedName?: string } => {
+      const nameValidation = validateServerName(name);
+      if (!nameValidation.valid) {
+        return { valid: false, message: nameValidation.message };
       }
 
       if (!config || typeof config !== 'object') {
@@ -356,12 +728,12 @@ export const batchCreateServers = async (req: Request, res: Response): Promise<v
         !normalizedConfig.url &&
         !normalizedConfig.openapi?.url &&
         !normalizedConfig.openapi?.schema &&
-        (!normalizedConfig.command || !normalizedConfig.args)
+        !normalizedConfig.command
       ) {
         return {
           valid: false,
           message:
-            'Server configuration must include either a URL, OpenAPI specification URL or schema, or command with arguments',
+            'Server configuration must include either a URL, OpenAPI specification URL or schema, or command',
         };
       }
 
@@ -409,7 +781,7 @@ export const batchCreateServers = async (req: Request, res: Response): Promise<v
         return { valid: false, message: 'Headers are not supported for stdio server type' };
       }
 
-      return { valid: true };
+      return { valid: true, normalizedName: nameValidation.normalized };
     };
 
     // Process each server
@@ -418,7 +790,7 @@ export const batchCreateServers = async (req: Request, res: Response): Promise<v
     let failureCount = 0;
 
     // Get current user for owner field
-    const currentUser = (req as any).user;
+    const currentUser = getRequestUser(req);
     const defaultOwner = currentUser?.username || 'admin';
 
     for (const server of servers) {
@@ -436,34 +808,45 @@ export const batchCreateServers = async (req: Request, res: Response): Promise<v
         continue;
       }
 
+      const serverName = validation.normalizedName ?? name;
+
       try {
         // Set default keep-alive interval for SSE servers if not specified
         const normalizedConfig = normalizeServerConfigForPersistence(config);
 
         if (
-          (normalizedConfig.type === 'sse' ||
-            (!normalizedConfig.type && normalizedConfig.url)) &&
+          (normalizedConfig.type === 'sse' || (!normalizedConfig.type && normalizedConfig.url)) &&
           !normalizedConfig.keepAliveInterval
         ) {
           normalizedConfig.keepAliveInterval = 60000; // Default 60 seconds for SSE servers
         }
 
-        // Set owner property if not provided
-        if (!normalizedConfig.owner) {
-          normalizedConfig.owner = defaultOwner;
+        if (isPrivilegedServerConfig(normalizedConfig) && currentUser?.isAdmin !== true) {
+          results.push({
+            name: serverName,
+            success: false,
+            message: 'Only admins can create or modify stdio-based servers',
+          });
+          failureCount++;
+          continue;
         }
 
+        // Set owner property if not provided
+        normalizedConfig.owner = currentUser?.isAdmin
+          ? normalizedConfig.owner || defaultOwner
+          : defaultOwner;
+
         // Attempt to add server
-        const result = await addServer(name, normalizedConfig);
+        const result = await addServer(serverName, normalizedConfig);
         if (result.success) {
           results.push({
-            name,
+            name: serverName,
             success: true,
           });
           successCount++;
         } else {
           results.push({
-            name,
+            name: serverName,
             success: false,
             message: result.message || 'Failed to add server',
           });
@@ -471,7 +854,7 @@ export const batchCreateServers = async (req: Request, res: Response): Promise<v
         }
       } catch (error) {
         results.push({
-          name,
+          name: serverName,
           success: false,
           message: error instanceof Error ? error.message : 'Internal server error',
         });
@@ -496,7 +879,9 @@ export const batchCreateServers = async (req: Request, res: Response): Promise<v
 
     if (successCount > 0) {
       const successfulServerNames = results
-        .filter((result): result is BatchServerResult & { name: string; success: true } => result.success)
+        .filter(
+          (result): result is BatchServerResult & { name: string; success: true } => result.success,
+        )
         .map((result) => result.name);
 
       Promise.all(
@@ -504,11 +889,11 @@ export const batchCreateServers = async (req: Request, res: Response): Promise<v
           notifyToolChanged(serverName, { reportEmbeddingProgress: true }),
         ),
       ).catch((error) => {
-        console.error('Failed to trigger embedding sync for batch-created servers:', error);
+        logger.error('Failed to trigger embedding sync for batch-created servers:', error);
       });
     }
   } catch (error) {
-    console.error('Batch create servers error:', error);
+    logger.error('Batch create servers error:', error);
     res.status(500).json({
       success: false,
       message: 'Internal server error',
@@ -527,7 +912,12 @@ export const deleteServer = async (req: Request, res: Response): Promise<void> =
       return;
     }
 
-    const result = await removeServer(name);
+    const existingServer = await loadAuthorizedServer(req, res, name);
+    if (!existingServer) {
+      return;
+    }
+
+    const result = await removeServer(existingServer.name);
     if (result.success) {
       notifyToolChanged();
       res.json({
@@ -574,12 +964,12 @@ export const updateServer = async (req: Request, res: Response): Promise<void> =
       !normalizedConfig.url &&
       !normalizedConfig.openapi?.url &&
       !normalizedConfig.openapi?.schema &&
-      (!normalizedConfig.command || !normalizedConfig.args)
+      !normalizedConfig.command
     ) {
       res.status(400).json({
         success: false,
         message:
-          'Server configuration must include either a URL, OpenAPI specification URL or schema, or command with arguments',
+          'Server configuration must include either a URL, OpenAPI specification URL or schema, or command',
       });
       return;
     }
@@ -639,39 +1029,58 @@ export const updateServer = async (req: Request, res: Response): Promise<void> =
       return;
     }
 
+    const existingServer = await loadAuthorizedServer(req, res, name);
+    if (!existingServer) {
+      return;
+    }
+
+    if (!ensureNonAdminCanManageConfig(req, res, normalizedConfig)) {
+      return;
+    }
+
     // Set default keep-alive interval for SSE servers if not specified
     if (
-      (normalizedConfig.type === 'sse' ||
-        (!normalizedConfig.type && normalizedConfig.url)) &&
+      (normalizedConfig.type === 'sse' || (!normalizedConfig.type && normalizedConfig.url)) &&
       !normalizedConfig.keepAliveInterval
     ) {
       normalizedConfig.keepAliveInterval = 60000; // Default 60 seconds for SSE servers
     }
 
     // Set owner property if not provided - use current user's username, default to 'admin'
-    if (!normalizedConfig.owner) {
-      const currentUser = (req as any).user;
-      normalizedConfig.owner = currentUser?.username || 'admin';
-    }
+    assignServerOwner(req, normalizedConfig, existingServer.owner);
 
     // Check if server name is being changed
     const isRenaming = newName && newName !== name;
 
+    // Final server name used for the rest of the update flow (the new name when
+    // renaming, otherwise the original name).
+    let finalName = name;
+
     // If renaming, validate the new name and update references
     if (isRenaming) {
       const serverDao = getServerDao();
-
-      // Check if new name already exists
-      if (await serverDao.exists(newName)) {
+      const nameValidation = validateServerName(newName);
+      if (!nameValidation.valid) {
         res.status(400).json({
           success: false,
-          message: `Server name '${newName}' already exists`,
+          message: nameValidation.message,
+        });
+        return;
+      }
+      const targetName = nameValidation.normalized as string;
+      finalName = targetName;
+
+      // Check if new name already exists
+      if (await serverDao.exists(targetName)) {
+        res.status(400).json({
+          success: false,
+          message: `Server name '${targetName}' already exists`,
         });
         return;
       }
 
       // Rename the server
-      const renamed = await serverDao.rename(name, newName);
+      const renamed = await serverDao.rename(name, targetName);
       if (!renamed) {
         res.status(404).json({
           success: false,
@@ -680,21 +1089,79 @@ export const updateServer = async (req: Request, res: Response): Promise<void> =
         return;
       }
 
+      // Close the runtime still keyed by the OLD name. addOrUpdateServer below
+      // closes by `finalName` (the new name), which finds nothing - the entry is
+      // still registered under the old name until initializeClientsFromSettings
+      // rebuilds serverInfos. Without this explicit close the old stdio child
+      // process tree is orphaned and leaks until the process restarts.
+      closeServer(name);
+      await deleteCredentialBindings({ serverName: name });
+
       // Update references in groups
       const groupDao = getGroupDao();
-      await groupDao.updateServerName(name, newName);
+      await groupDao.updateServerName(name, targetName);
 
       // Update references in bearer keys
       const bearerKeyDao = getBearerKeyDao();
-      await bearerKeyDao.updateServerName(name, newName);
+      await bearerKeyDao.updateServerName(name, targetName);
+
+      // Drop embeddings stored under the old name so search_tools does not
+      // advertise phantom tools; addOrUpdateServer below regenerates them
+      // under the new name. A failure here must not abort the rename.
+      try {
+        await removeServerToolEmbeddings(name);
+      } catch (error) {
+        logger.warn('Failed to remove embeddings for renamed server', {
+          serverName: name,
+          error,
+        });
+      }
     }
 
-    // Use the final server name (new name if renaming, otherwise original name)
-    const finalName = isRenaming ? newName : name;
+    // Fast path: if no connection-relevant field changed, persist and update
+    // in-memory access metadata without tearing down the runtime. This covers
+    // visibility/sharedWithUsers edits, description-only edits, owner changes,
+    // and no-op edits alike - none of them need a reconnect.
+    if (!isRenaming && !hasConnectionRelevantChange(existingServer, normalizedConfig)) {
+      const serverDao = getServerDao();
+      const updatedServer = await serverDao.update(name, normalizedConfig);
+
+      if (!updatedServer) {
+        res.status(404).json({
+          success: false,
+          message: 'Server not found or failed to update',
+        });
+        return;
+      }
+
+      updateServerInfoVisibility(
+        finalName,
+        normalizedConfig.visibility ?? 'private',
+        normalizedConfig.sharedWithUsers,
+      );
+      broadcastToolListChanged();
+
+      res.json({
+        success: true,
+        message: 'Server updated successfully',
+      });
+      return;
+    }
 
     const result = await addOrUpdateServer(finalName, normalizedConfig, true); // Allow override for updates
     if (result.success) {
-      notifyToolChanged(finalName);
+      // On-demand servers repopulate their tool cache via primeOnDemandServers
+      // inside initializeClientsFromSettings, which is awaited for a targeted
+      // reload. Await it here too: the dashboard refreshes the server list as
+      // soon as the PUT responds, and without this the refresh would race ahead
+      // of the prime and show an empty tool list until the next 30s poll (or a
+      // manual refresh). Non-on-demand servers keep the existing fire-and-forget
+      // behavior since their connect is already async. See #1032.
+      if (normalizedConfig.startOnDemand === true) {
+        await notifyToolChanged(finalName);
+      } else {
+        notifyToolChanged(finalName);
+      }
       res.json({
         success: true,
         message: isRenaming
@@ -708,9 +1175,9 @@ export const updateServer = async (req: Request, res: Response): Promise<void> =
       });
     }
   } catch (error) {
-    res.status(500).json({
+    res.status(error instanceof CredentialBindingError ? 400 : 500).json({
       success: false,
-      message: 'Internal server error',
+      message: error instanceof CredentialBindingError ? error.message : 'Internal server error',
     });
   }
 };
@@ -719,14 +1186,30 @@ export const getServerConfig = async (req: Request, res: Response): Promise<void
   try {
     const { name } = req.params;
 
-    // Get server configuration from DAO (supports both file and database modes)
     const serverDao = getServerDao();
-    const serverConfig = await serverDao.findById(name);
-
-    if (!serverConfig) {
+    const serverRecord = await serverDao.findById(name);
+    if (!serverRecord) {
       res.status(404).json({
         success: false,
         message: 'Server not found',
+      });
+      return;
+    }
+
+    // #1036 Phase 1: config read and server use are separate decisions.
+    // Owner/admin get the full configuration; visibility-admitted shared users
+    // (public / group members) get a safe view without secret-bearing fields;
+    // everyone else is rejected exactly as before.
+    const principal = getRequestUser(req);
+    const canReadFullConfig = authorizationService.can(
+      'server.config.read',
+      serverRecord,
+      principal,
+    );
+    if (!canReadFullConfig && !authorizationService.can('server.invoke', serverRecord, principal)) {
+      res.status(403).json({
+        success: false,
+        message: 'Forbidden',
       });
       return;
     }
@@ -736,21 +1219,25 @@ export const getServerConfig = async (req: Request, res: Response): Promise<void
     const serverInfo = allServers.find((s) => s.name === name);
 
     // Extract config without the name field
-    const { name: serverName, ...config } = serverConfig;
+    const { name: serverName, ...config } = serverRecord;
+    const presented = presentServerForPrincipal(config, principal);
 
+    // OpenAPI tools can carry circular $ref cycles left by SwaggerParser.dereference
+    // (recursive schemas), which would make res.json throw. Mirror the list endpoint
+    // and sanitize via createSafeJSON. See #959.
     const response: ApiResponse = {
       success: true,
-      data: {
+      data: createSafeJSON({
         name: serverName,
         status: serverInfo?.status || 'disconnected',
         tools: serverInfo?.tools || [],
-        config,
-      },
+        config: presented.data,
+      }),
     };
 
     res.json(response);
   } catch (error) {
-    console.error('Failed to get server configuration:', error);
+    logger.error('Failed to get server configuration:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to get server configuration',
@@ -778,9 +1265,24 @@ export const toggleServer = async (req: Request, res: Response): Promise<void> =
       return;
     }
 
-    const result = await toggleServerStatus(name, enabled);
+    const existingServer = await loadAuthorizedServer(req, res, name);
+    if (!existingServer) {
+      return;
+    }
+
+    const result = await toggleServerStatus(existingServer.name, enabled);
     if (result.success) {
-      notifyToolChanged();
+      // On disable, toggleServerStatus synchronously closes the server and
+      // updates serverInfos, so we broadcast the now-removed tools/prompts/
+      // resources here. On enable, the connection completes asynchronously
+      // inside initializeClientsFromSettings, which broadcasts itself once the
+      // tools/prompts/resources are actually loaded — broadcasting here would
+      // race ahead of that and push a stale (empty) list. See #938 / #942.
+      if (!enabled) {
+        broadcastToolListChanged();
+        broadcastPromptListChanged();
+        broadcastResourceListChanged();
+      }
       res.json({
         success: true,
         message: result.message || `Server ${enabled ? 'enabled' : 'disabled'} successfully`,
@@ -810,17 +1312,139 @@ export const reloadServer = async (req: Request, res: Response): Promise<void> =
       return;
     }
 
-    await reconnectServer(name);
+    const existingServer = await loadAuthorizedServer(req, res, name);
+    if (!existingServer) {
+      return;
+    }
+
+    await reconnectServer(existingServer.name);
 
     res.json({
       success: true,
       message: `Server ${name} reloaded successfully`,
     });
   } catch (error) {
-    console.error('Failed to reload server:', error);
+    logger.error('Failed to reload server:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to reload server',
+    });
+  }
+};
+
+const parseOAuthDisconnectScope = (scope: unknown): UpstreamOAuthDisconnectScope | null => {
+  if (scope === undefined) {
+    return 'tokens';
+  }
+
+  if (scope === 'tokens' || scope === 'all') {
+    return scope;
+  }
+
+  return null;
+};
+
+export const disconnectServerOAuth = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { name } = req.params;
+    if (!name) {
+      res.status(400).json({
+        success: false,
+        message: 'Server name is required',
+      });
+      return;
+    }
+
+    const scope = parseOAuthDisconnectScope(req.body?.scope);
+    if (!scope) {
+      res.status(400).json({
+        success: false,
+        message: 'OAuth disconnect scope must be "tokens" or "all"',
+      });
+      return;
+    }
+
+    const existingServer = await loadAuthorizedServer(req, res, name);
+    if (!existingServer) {
+      return;
+    }
+
+    const result = await disconnectUpstreamOAuth(existingServer.name, { scope });
+    const { success: _success, ...data } = result;
+
+    res.json({
+      success: true,
+      message: `Server ${name} OAuth disconnected successfully`,
+      data,
+    });
+  } catch (error) {
+    logger.error('Failed to disconnect server OAuth:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to disconnect server OAuth',
+    });
+  }
+};
+
+// Reinstall server: clear package cache and reconnect
+export const reinstallServerHandler = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { name } = req.params;
+    if (!name) {
+      res.status(400).json({
+        success: false,
+        message: 'Server name is required',
+      });
+      return;
+    }
+
+    const existingServer = await loadAuthorizedServer(req, res, name);
+    if (!existingServer) {
+      return;
+    }
+
+    await reinstallServer(existingServer.name);
+
+    res.json({
+      success: true,
+      message: `Server ${name} reinstall initiated`,
+    });
+  } catch (error) {
+    logger.error('Failed to reinstall server:', error);
+    const message = error instanceof Error ? error.message : 'Failed to reinstall server';
+    // Validation errors (unsupported command, disabled server) → 400
+    if (message.includes('does not support cache refresh') || message.includes('disabled server')) {
+      res.status(400).json({ success: false, message });
+    } else {
+      res.status(500).json({ success: false, message: 'Failed to reinstall server' });
+    }
+  }
+};
+
+// Clear all runner caches (npm + uv). Admin-only.
+export const clearCache = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const user = (req as any).user;
+    if (!user?.isAdmin) {
+      res.status(403).json({
+        success: false,
+        message: 'Only admins can clear runner caches',
+      });
+      return;
+    }
+
+    const results = await clearAllCaches();
+
+    res.json({
+      success: true,
+      message: 'Cache clear completed',
+      results,
+    });
+  } catch (error) {
+    logger.error('Failed to clear cache:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to clear cache',
     });
   }
 };
@@ -833,7 +1457,7 @@ export const toggleTool = async (req: Request, res: Response): Promise<void> => 
     const toolName = decodeURIComponent(req.params.toolName);
     const { enabled } = req.body;
 
-    if (!serverName || !toolName) {
+    if (!serverName || !toolName || ['__proto__', 'constructor', 'prototype'].includes(toolName)) {
       res.status(400).json({
         success: false,
         message: 'Server name and tool name are required',
@@ -849,16 +1473,12 @@ export const toggleTool = async (req: Request, res: Response): Promise<void> => 
       return;
     }
 
-    const serverDao = getServerDao();
-    const server = await serverDao.findById(serverName);
-
+    const server = await loadAuthorizedServer(req, res, serverName);
     if (!server) {
-      res.status(404).json({
-        success: false,
-        message: 'Server not found',
-      });
       return;
     }
+
+    const serverDao = getServerDao();
 
     // Initialize tools config if it doesn't exist
     const tools = server.tools || {};
@@ -875,6 +1495,18 @@ export const toggleTool = async (req: Request, res: Response): Promise<void> => 
         message: 'Failed to save settings',
       });
       return;
+    }
+
+    // For an already-connected server, notifyToolChanged()'s full re-init pass
+    // takes the "already connected" shortcut and preserves the in-memory
+    // serverInfo verbatim (see registerAllTools) instead of applying the
+    // freshly-persisted tools config — so findToolOnServer's enabled check
+    // would keep seeing the pre-toggle state until the server reconnects for
+    // an unrelated reason. Patch the live config in place so the toggle takes
+    // effect immediately, without waiting for (or forcing) a reconnect.
+    const liveServer = getServerByName(serverName);
+    if (liveServer?.config) {
+      liveServer.config = { ...liveServer.config, tools };
     }
 
     // Notify that tools have changed
@@ -900,7 +1532,7 @@ export const updateToolDescription = async (req: Request, res: Response): Promis
     const toolName = decodeURIComponent(req.params.toolName);
     const { description } = req.body;
 
-    if (!serverName || !toolName) {
+    if (!serverName || !toolName || ['__proto__', 'constructor', 'prototype'].includes(toolName)) {
       res.status(400).json({
         success: false,
         message: 'Server name and tool name are required',
@@ -916,16 +1548,12 @@ export const updateToolDescription = async (req: Request, res: Response): Promis
       return;
     }
 
-    const serverDao = getServerDao();
-    const server = await serverDao.findById(serverName);
-
+    const server = await loadAuthorizedServer(req, res, serverName);
     if (!server) {
-      res.status(404).json({
-        success: false,
-        message: 'Server not found',
-      });
       return;
     }
+
+    const serverDao = getServerDao();
 
     // Initialize tools config if it doesn't exist
     const tools = server.tools || {};
@@ -945,6 +1573,14 @@ export const updateToolDescription = async (req: Request, res: Response): Promis
         message: 'Failed to save settings',
       });
       return;
+    }
+
+    // Same stale-config gap as toggleTool: keep the live serverInfo in sync so
+    // a subsequent enable/disable check (or the dashboard's display of this
+    // description) doesn't read pre-update state.
+    const liveServerForDescription = getServerByName(serverName);
+    if (liveServerForDescription?.config) {
+      liveServerForDescription.config = { ...liveServerForDescription.config, tools };
     }
 
     // Notify that tools have changed
@@ -970,7 +1606,7 @@ export const resetToolDescription = async (req: Request, res: Response): Promise
     const serverName = decodeURIComponent(req.params.serverName);
     const toolName = decodeURIComponent(req.params.toolName);
 
-    if (!serverName || !toolName) {
+    if (!serverName || !toolName || ['__proto__', 'constructor', 'prototype'].includes(toolName)) {
       res.status(400).json({
         success: false,
         message: 'Server name and tool name are required',
@@ -978,16 +1614,12 @@ export const resetToolDescription = async (req: Request, res: Response): Promise
       return;
     }
 
-    const serverDao = getServerDao();
-    const server = await serverDao.findById(serverName);
-
+    const server = await loadAuthorizedServer(req, res, serverName);
     if (!server) {
-      res.status(404).json({
-        success: false,
-        message: 'Server not found',
-      });
       return;
     }
+
+    const serverDao = getServerDao();
 
     const tools = clearDescriptionOverride(server.tools || {}, toolName);
 
@@ -1023,16 +1655,29 @@ export const resetToolDescription = async (req: Request, res: Response): Promise
 };
 
 export const updateSystemConfig = async (req: Request, res: Response): Promise<void> => {
+  const user = getRequestUser(req);
+  if (!user?.isAdmin) {
+    res.status(403).json({
+      success: false,
+      message: 'Admin privileges required',
+    });
+    return;
+  }
+
   try {
     const {
       routing,
       install,
-      smartRouting,
+      smartRouting: requestSmartRouting,
+      toolResultCompression,
       mcpRouter,
       nameSeparator,
       enableSessionRebuild,
       oauthServer,
+      auth,
+      activityLog,
     } = req.body;
+    const { smartRouting } = migrateLegacySmartRoutingConfig(requestSmartRouting);
 
     const hasRoutingUpdate =
       routing &&
@@ -1048,7 +1693,8 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
       install &&
       (typeof install.pythonIndexUrl === 'string' ||
         typeof install.npmRegistry === 'string' ||
-        typeof install.baseUrl === 'string');
+        typeof install.baseUrl === 'string' ||
+        typeof install.publicBaseUrl === 'string');
 
     const hasSmartRoutingUpdate =
       smartRouting &&
@@ -1058,16 +1704,30 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
         smartRouting.basePacingDelayMs === null ||
         typeof smartRouting.embeddingProvider === 'string' ||
         typeof smartRouting.embeddingEncodingFormat === 'string' ||
-        typeof smartRouting.openaiApiBaseUrl === 'string' ||
-        typeof smartRouting.openaiApiKey === 'string' ||
-        typeof smartRouting.openaiApiEmbeddingModel === 'string' ||
+        typeof smartRouting.embeddingDimensions === 'number' ||
+        smartRouting.embeddingDimensions === null ||
+        typeof smartRouting.embeddingDimensionsApiPassthrough === 'boolean' ||
+        typeof smartRouting.llmProviderBaseUrl === 'string' ||
+        typeof smartRouting.llmProviderApiKey === 'string' ||
+        typeof smartRouting.embeddingModel === 'string' ||
         typeof smartRouting.azureOpenaiEndpoint === 'string' ||
         typeof smartRouting.azureOpenaiApiKey === 'string' ||
         typeof smartRouting.azureOpenaiApiVersion === 'string' ||
         typeof smartRouting.azureOpenaiEmbeddingDeployment === 'string' ||
         typeof smartRouting.progressiveDisclosure === 'boolean' ||
+        typeof smartRouting.azureOpenaiEmbeddingModel === 'string' ||
+        typeof smartRouting.serverDescriptionMode === 'string' ||
+        typeof smartRouting.embeddingQueryPrefix === 'string' ||
+        typeof smartRouting.embeddingDocumentPrefix === 'string' ||
         typeof smartRouting.embeddingMaxTokens === 'number' ||
         smartRouting.embeddingMaxTokens === null);
+
+    const hasToolResultCompressionUpdate =
+      toolResultCompression &&
+      (typeof toolResultCompression.enabled === 'boolean' ||
+        typeof toolResultCompression.minTokens === 'number' ||
+        typeof toolResultCompression.maxOutputTokens === 'number' ||
+        typeof toolResultCompression.strategy === 'string');
 
     const hasMcpRouterUpdate =
       mcpRouter &&
@@ -1079,6 +1739,8 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
     const hasNameSeparatorUpdate = typeof nameSeparator === 'string';
 
     const hasSessionRebuildUpdate = typeof enableSessionRebuild === 'boolean';
+
+    const hasActivityLogUpdate = activityLog && typeof activityLog.storeToolPayload === 'boolean';
 
     const hasOAuthServerUpdate =
       oauthServer &&
@@ -1092,16 +1754,38 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
         (oauthServer.dynamicRegistration &&
           (typeof oauthServer.dynamicRegistration.enabled === 'boolean' ||
             typeof oauthServer.dynamicRegistration.requiresAuthentication === 'boolean' ||
+            typeof oauthServer.dynamicRegistration.clientTtl === 'number' ||
             Array.isArray(oauthServer.dynamicRegistration.allowedGrantTypes))));
+
+    const hasBetterAuthUpdate =
+      auth?.betterAuth &&
+      (typeof auth.betterAuth.enabled === 'boolean' ||
+        typeof auth.betterAuth.baseUrl === 'string' ||
+        typeof auth.betterAuth.basePath === 'string' ||
+        Array.isArray(auth.betterAuth.trustedOrigins) ||
+        (auth.betterAuth.providers &&
+          (typeof auth.betterAuth.providers.google?.enabled === 'boolean' ||
+            typeof auth.betterAuth.providers.github?.enabled === 'boolean' ||
+            (auth.betterAuth.providers.oidc &&
+              (typeof auth.betterAuth.providers.oidc.enabled === 'boolean' ||
+                typeof auth.betterAuth.providers.oidc.providerId === 'string' ||
+                typeof auth.betterAuth.providers.oidc.discoveryUrl === 'string' ||
+                Array.isArray(auth.betterAuth.providers.oidc.scopes) ||
+                typeof auth.betterAuth.providers.oidc.pkce === 'boolean' ||
+                typeof auth.betterAuth.providers.oidc.prompt === 'string' ||
+                auth.betterAuth.providers.oidc.prompt === null)))));
 
     if (
       !hasRoutingUpdate &&
       !hasInstallUpdate &&
       !hasSmartRoutingUpdate &&
+      !hasToolResultCompressionUpdate &&
       !hasMcpRouterUpdate &&
       !hasNameSeparatorUpdate &&
       !hasSessionRebuildUpdate &&
-      !hasOAuthServerUpdate
+      !hasOAuthServerUpdate &&
+      !hasBetterAuthUpdate &&
+      !hasActivityLogUpdate
     ) {
       res.status(400).json({
         success: false,
@@ -1135,13 +1819,20 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
           dbUrl: '',
           basePacingDelayMs: undefined,
           embeddingProvider: 'openai',
-          openaiApiBaseUrl: '',
-          openaiApiKey: '',
-          openaiApiEmbeddingModel: '',
+          embeddingDimensions: undefined,
+          llmProviderBaseUrl: '',
+          llmProviderApiKey: '',
+          embeddingModel: '',
           azureOpenaiEndpoint: '',
           azureOpenaiApiKey: '',
           azureOpenaiApiVersion: '',
           azureOpenaiEmbeddingDeployment: '',
+        },
+        toolResultCompression: {
+          enabled: false,
+          minTokens: 2000,
+          maxOutputTokens: 1200,
+          strategy: 'auto',
         },
         mcpRouter: {
           apiKey: '',
@@ -1150,6 +1841,9 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
           baseUrl: 'https://api.mcprouter.to/v1',
         },
         oauthServer: cloneDefaultOAuthServerConfig(),
+        auth: {
+          betterAuth: {},
+        },
       };
     }
 
@@ -1179,13 +1873,23 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
         dbUrl: '',
         basePacingDelayMs: undefined,
         embeddingProvider: 'openai',
-        openaiApiBaseUrl: '',
-        openaiApiKey: '',
-        openaiApiEmbeddingModel: '',
+        embeddingDimensions: undefined,
+        llmProviderBaseUrl: '',
+        llmProviderApiKey: '',
+        embeddingModel: '',
         azureOpenaiEndpoint: '',
         azureOpenaiApiKey: '',
         azureOpenaiApiVersion: '',
         azureOpenaiEmbeddingDeployment: '',
+      };
+    }
+
+    if (!systemConfig.toolResultCompression) {
+      systemConfig.toolResultCompression = {
+        enabled: false,
+        minTokens: 2000,
+        maxOutputTokens: 1200,
+        strategy: 'auto',
       };
     }
 
@@ -1218,6 +1922,14 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
         ],
         requiresAuthentication: defaultDynamic.requiresAuthentication ?? false,
       };
+    }
+
+    if (!systemConfig.auth) {
+      systemConfig.auth = {};
+    }
+
+    if (!systemConfig.auth.betterAuth) {
+      systemConfig.auth.betterAuth = {};
     }
 
     if (routing) {
@@ -1260,6 +1972,9 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
       if (typeof install.baseUrl === 'string') {
         systemConfig.install.baseUrl = install.baseUrl;
       }
+      if (typeof install.publicBaseUrl === 'string') {
+        systemConfig.install.publicBaseUrl = install.publicBaseUrl.trim();
+      }
     }
 
     // Track smartRouting state and configuration changes
@@ -1278,6 +1993,21 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
         const normalized = smartRouting.embeddingEncodingFormat.trim().toLowerCase();
         systemConfig.smartRouting.embeddingEncodingFormat =
           normalized === 'base64' || normalized === 'float' ? normalized : 'auto';
+      }
+
+      if (
+        typeof smartRouting.embeddingDimensions === 'number' &&
+        Number.isSafeInteger(smartRouting.embeddingDimensions) &&
+        smartRouting.embeddingDimensions > 0
+      ) {
+        systemConfig.smartRouting.embeddingDimensions = smartRouting.embeddingDimensions;
+      } else if (smartRouting.embeddingDimensions === null) {
+        systemConfig.smartRouting.embeddingDimensions = undefined;
+      }
+
+      if (typeof smartRouting.embeddingDimensionsApiPassthrough === 'boolean') {
+        systemConfig.smartRouting.embeddingDimensionsApiPassthrough =
+          smartRouting.embeddingDimensionsApiPassthrough;
       }
 
       if (typeof smartRouting.enabled === 'boolean') {
@@ -1323,21 +2053,24 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
               return;
             }
           } else {
-            // Get current OpenAI config values, preferring new values from request
-            const currentOpenAiKey = typeof smartRouting.openaiApiKey === 'string'
-              ? smartRouting.openaiApiKey.trim()
-              : (systemConfig.smartRouting.openaiApiKey || '').trim();
-            const currentOpenaiApiBaseUrl = typeof smartRouting.openaiApiBaseUrl === 'string'
-              ? smartRouting.openaiApiBaseUrl.trim()
-              : (systemConfig.smartRouting.openaiApiBaseUrl || '').trim();
-            const currentOpenaiApiEmbeddingModel = typeof smartRouting.openaiApiEmbeddingModel === 'string'
-              ? smartRouting.openaiApiEmbeddingModel.trim()
-              : (systemConfig.smartRouting.openaiApiEmbeddingModel || '').trim();
+            // Get current LLM provider config values, preferring new values from request
+            const currentLlmProviderApiKey =
+              typeof smartRouting.llmProviderApiKey === 'string'
+                ? smartRouting.llmProviderApiKey.trim()
+                : (systemConfig.smartRouting.llmProviderApiKey || '').trim();
+            const currentLlmProviderBaseUrl =
+              typeof smartRouting.llmProviderBaseUrl === 'string'
+                ? smartRouting.llmProviderBaseUrl.trim()
+                : (systemConfig.smartRouting.llmProviderBaseUrl || '').trim();
+            const currentEmbeddingModel =
+              typeof smartRouting.embeddingModel === 'string'
+                ? smartRouting.embeddingModel.trim()
+                : (systemConfig.smartRouting.embeddingModel || '').trim();
 
-            if (!currentOpenAiKey || !currentOpenaiApiBaseUrl || !currentOpenaiApiEmbeddingModel) {
+            if (!currentLlmProviderApiKey || !currentLlmProviderBaseUrl || !currentEmbeddingModel) {
               res.status(400).json({
                 message:
-                  'Smart routing cannot be enabled without OpenAI configuration. Please provide API key, API base URL, and embedding model.',
+                  'Smart routing cannot be enabled without LLM provider configuration. Please provide API key, API base URL, and embedding model.',
               });
               return;
             }
@@ -1357,15 +2090,14 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
       } else if (smartRouting.basePacingDelayMs === null) {
         systemConfig.smartRouting.basePacingDelayMs = undefined;
       }
-      if (typeof smartRouting.openaiApiBaseUrl === 'string') {
-        systemConfig.smartRouting.openaiApiBaseUrl = smartRouting.openaiApiBaseUrl?.trim();
+      if (typeof smartRouting.llmProviderBaseUrl === 'string') {
+        systemConfig.smartRouting.llmProviderBaseUrl = smartRouting.llmProviderBaseUrl?.trim();
       }
-      if (typeof smartRouting.openaiApiKey === 'string') {
-        systemConfig.smartRouting.openaiApiKey = smartRouting.openaiApiKey?.trim();
+      if (typeof smartRouting.llmProviderApiKey === 'string') {
+        systemConfig.smartRouting.llmProviderApiKey = smartRouting.llmProviderApiKey?.trim();
       }
-      if (typeof smartRouting.openaiApiEmbeddingModel === 'string') {
-        systemConfig.smartRouting.openaiApiEmbeddingModel =
-          smartRouting.openaiApiEmbeddingModel?.trim();
+      if (typeof smartRouting.embeddingModel === 'string') {
+        systemConfig.smartRouting.embeddingModel = smartRouting.embeddingModel?.trim();
       }
 
       if (typeof smartRouting.azureOpenaiEndpoint === 'string') {
@@ -1375,15 +2107,34 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
         systemConfig.smartRouting.azureOpenaiApiKey = smartRouting.azureOpenaiApiKey?.trim();
       }
       if (typeof smartRouting.azureOpenaiApiVersion === 'string') {
-        systemConfig.smartRouting.azureOpenaiApiVersion = smartRouting.azureOpenaiApiVersion?.trim();
+        systemConfig.smartRouting.azureOpenaiApiVersion =
+          smartRouting.azureOpenaiApiVersion?.trim();
       }
       if (typeof smartRouting.azureOpenaiEmbeddingDeployment === 'string') {
         systemConfig.smartRouting.azureOpenaiEmbeddingDeployment =
           smartRouting.azureOpenaiEmbeddingDeployment?.trim();
       }
+      if (typeof smartRouting.azureOpenaiEmbeddingModel === 'string') {
+        systemConfig.smartRouting.azureOpenaiEmbeddingModel =
+          smartRouting.azureOpenaiEmbeddingModel.trim();
+      }
 
       if (typeof smartRouting.progressiveDisclosure === 'boolean') {
         systemConfig.smartRouting.progressiveDisclosure = smartRouting.progressiveDisclosure;
+      }
+
+      if (typeof smartRouting.serverDescriptionMode === 'string') {
+        // Same normalization as getSmartRoutingConfig(), so the API and the env var agree
+        const normalized = smartRouting.serverDescriptionMode.trim().toLowerCase();
+        systemConfig.smartRouting.serverDescriptionMode = normalized === 'full' ? 'full' : 'names';
+      }
+
+      // Stored verbatim, not trimmed: the trailing space is part of a task prefix
+      if (typeof smartRouting.embeddingQueryPrefix === 'string') {
+        systemConfig.smartRouting.embeddingQueryPrefix = smartRouting.embeddingQueryPrefix;
+      }
+      if (typeof smartRouting.embeddingDocumentPrefix === 'string') {
+        systemConfig.smartRouting.embeddingDocumentPrefix = smartRouting.embeddingDocumentPrefix;
       }
 
       if (
@@ -1404,11 +2155,15 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
           systemConfig.smartRouting.embeddingProvider ||
         previousSmartRoutingConfig.embeddingEncodingFormat !==
           systemConfig.smartRouting.embeddingEncodingFormat ||
-        previousSmartRoutingConfig.openaiApiBaseUrl !==
-          systemConfig.smartRouting.openaiApiBaseUrl ||
-        previousSmartRoutingConfig.openaiApiKey !== systemConfig.smartRouting.openaiApiKey ||
-        previousSmartRoutingConfig.openaiApiEmbeddingModel !==
-          systemConfig.smartRouting.openaiApiEmbeddingModel ||
+        previousSmartRoutingConfig.embeddingDimensions !==
+          systemConfig.smartRouting.embeddingDimensions ||
+        previousSmartRoutingConfig.embeddingDimensionsApiPassthrough !==
+          systemConfig.smartRouting.embeddingDimensionsApiPassthrough ||
+        previousSmartRoutingConfig.llmProviderBaseUrl !==
+          systemConfig.smartRouting.llmProviderBaseUrl ||
+        previousSmartRoutingConfig.llmProviderApiKey !==
+          systemConfig.smartRouting.llmProviderApiKey ||
+        previousSmartRoutingConfig.embeddingModel !== systemConfig.smartRouting.embeddingModel ||
         previousSmartRoutingConfig.azureOpenaiEndpoint !==
           systemConfig.smartRouting.azureOpenaiEndpoint ||
         previousSmartRoutingConfig.azureOpenaiApiKey !==
@@ -1417,6 +2172,10 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
           systemConfig.smartRouting.azureOpenaiApiVersion ||
         previousSmartRoutingConfig.azureOpenaiEmbeddingDeployment !==
           systemConfig.smartRouting.azureOpenaiEmbeddingDeployment ||
+        previousSmartRoutingConfig.azureOpenaiEmbeddingModel !==
+          systemConfig.smartRouting.azureOpenaiEmbeddingModel ||
+        (previousSmartRoutingConfig.embeddingDocumentPrefix ?? '') !==
+          (systemConfig.smartRouting.embeddingDocumentPrefix ?? '') ||
         previousSmartRoutingConfig.embeddingMaxTokens !==
           systemConfig.smartRouting.embeddingMaxTokens;
 
@@ -1436,6 +2195,33 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
       }
       if (typeof mcpRouter.baseUrl === 'string') {
         systemConfig.mcpRouter.baseUrl = mcpRouter.baseUrl;
+      }
+    }
+
+    if (toolResultCompression) {
+      const target = systemConfig.toolResultCompression;
+      if (typeof toolResultCompression.enabled === 'boolean') {
+        target.enabled = toolResultCompression.enabled;
+      }
+      if (
+        typeof toolResultCompression.minTokens === 'number' &&
+        Number.isFinite(toolResultCompression.minTokens) &&
+        toolResultCompression.minTokens > 0
+      ) {
+        target.minTokens = Math.floor(toolResultCompression.minTokens);
+      }
+      if (
+        typeof toolResultCompression.maxOutputTokens === 'number' &&
+        Number.isFinite(toolResultCompression.maxOutputTokens) &&
+        toolResultCompression.maxOutputTokens > 0
+      ) {
+        target.maxOutputTokens = Math.floor(toolResultCompression.maxOutputTokens);
+      }
+      if (typeof toolResultCompression.strategy === 'string') {
+        const normalized = toolResultCompression.strategy.trim().toLowerCase();
+        target.strategy = ['auto', 'json', 'log', 'search', 'diff', 'text'].includes(normalized)
+          ? (normalized as any)
+          : 'auto';
       }
     }
 
@@ -1489,7 +2275,95 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
             oauthServer.dynamicRegistration.requiresAuthentication;
         }
 
+        if (
+          typeof oauthServer.dynamicRegistration.clientTtl === 'number' &&
+          Number.isFinite(oauthServer.dynamicRegistration.clientTtl) &&
+          oauthServer.dynamicRegistration.clientTtl >= 0
+        ) {
+          dynamicTarget.clientTtl = Math.floor(oauthServer.dynamicRegistration.clientTtl);
+        }
+
         target.dynamicRegistration = dynamicTarget;
+      }
+    }
+
+    if (auth?.betterAuth) {
+      const target = systemConfig.auth.betterAuth;
+      const providersTarget = target.providers || {};
+
+      if (typeof auth.betterAuth.enabled === 'boolean') {
+        target.enabled = auth.betterAuth.enabled;
+      }
+
+      if (typeof auth.betterAuth.baseUrl === 'string') {
+        target.baseUrl = auth.betterAuth.baseUrl.trim();
+      }
+
+      if (typeof auth.betterAuth.basePath === 'string') {
+        target.basePath = auth.betterAuth.basePath.trim();
+      }
+
+      if (Array.isArray(auth.betterAuth.trustedOrigins)) {
+        target.trustedOrigins = auth.betterAuth.trustedOrigins
+          .filter((origin: any): origin is string => typeof origin === 'string')
+          .map((origin: string) => origin.trim())
+          .filter((origin: string) => origin.length > 0);
+      }
+
+      if (auth.betterAuth.providers) {
+        if (typeof auth.betterAuth.providers.google?.enabled === 'boolean') {
+          providersTarget.google = {
+            ...(providersTarget.google || {}),
+            enabled: auth.betterAuth.providers.google.enabled,
+          };
+        }
+
+        if (typeof auth.betterAuth.providers.github?.enabled === 'boolean') {
+          providersTarget.github = {
+            ...(providersTarget.github || {}),
+            enabled: auth.betterAuth.providers.github.enabled,
+          };
+        }
+
+        if (auth.betterAuth.providers.oidc) {
+          const oidcTarget = {
+            ...(providersTarget.oidc || {}),
+          };
+
+          if (typeof auth.betterAuth.providers.oidc.enabled === 'boolean') {
+            oidcTarget.enabled = auth.betterAuth.providers.oidc.enabled;
+          }
+
+          if (typeof auth.betterAuth.providers.oidc.providerId === 'string') {
+            oidcTarget.providerId = auth.betterAuth.providers.oidc.providerId.trim();
+          }
+
+          if (typeof auth.betterAuth.providers.oidc.discoveryUrl === 'string') {
+            oidcTarget.discoveryUrl = auth.betterAuth.providers.oidc.discoveryUrl.trim();
+          }
+
+          if (Array.isArray(auth.betterAuth.providers.oidc.scopes)) {
+            oidcTarget.scopes = auth.betterAuth.providers.oidc.scopes
+              .filter((scope: any): scope is string => typeof scope === 'string')
+              .map((scope: string) => scope.trim())
+              .filter((scope: string) => scope.length > 0);
+          }
+
+          if (typeof auth.betterAuth.providers.oidc.pkce === 'boolean') {
+            oidcTarget.pkce = auth.betterAuth.providers.oidc.pkce;
+          }
+
+          if (typeof auth.betterAuth.providers.oidc.prompt === 'string') {
+            const promptValue = auth.betterAuth.providers.oidc.prompt.trim();
+            oidcTarget.prompt = promptValue || undefined;
+          } else if (auth.betterAuth.providers.oidc.prompt === null) {
+            oidcTarget.prompt = undefined;
+          }
+
+          providersTarget.oidc = oidcTarget;
+        }
+
+        target.providers = providersTarget;
       }
     }
 
@@ -1501,9 +2375,17 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
       systemConfig.enableSessionRebuild = enableSessionRebuild;
     }
 
+    if (activityLog && typeof activityLog.storeToolPayload === 'boolean') {
+      systemConfig.activityLog = {
+        ...systemConfig.activityLog,
+        storeToolPayload: activityLog.storeToolPayload,
+      };
+    }
+
     // Save using DAO (supports both file and database modes)
     try {
       await systemConfigDao.update(systemConfig);
+      setCachedSystemConfig(systemConfig);
       res.json({
         success: true,
         data: systemConfig,
@@ -1512,14 +2394,14 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
 
       // If smart routing configuration changed, sync all existing server tools
       if (needsSync) {
-        console.log('SmartRouting configuration changed - syncing all existing server tools...');
+        logger.log('SmartRouting configuration changed - syncing all existing server tools...');
         // Run sync asynchronously to avoid blocking the response
         syncAllServerToolsEmbeddings().catch((error) => {
-          console.error('Failed to sync server tools embeddings:', error);
+          logger.error('Failed to sync server tools embeddings:', error);
         });
       }
     } catch (saveError) {
-      console.error('Failed to save system configuration:', saveError);
+      logger.error('Failed to save system configuration:', saveError);
       res.status(500).json({
         success: false,
         message: 'Failed to save system configuration',
@@ -1541,7 +2423,11 @@ export const togglePrompt = async (req: Request, res: Response): Promise<void> =
     const promptName = decodeURIComponent(req.params.promptName);
     const { enabled } = req.body;
 
-    if (!serverName || !promptName) {
+    if (
+      !serverName ||
+      !promptName ||
+      ['__proto__', 'constructor', 'prototype'].includes(promptName)
+    ) {
       res.status(400).json({
         success: false,
         message: 'Server name and prompt name are required',
@@ -1557,16 +2443,12 @@ export const togglePrompt = async (req: Request, res: Response): Promise<void> =
       return;
     }
 
-    const serverDao = getServerDao();
-    const server = await serverDao.findById(serverName);
-
+    const server = await loadAuthorizedServer(req, res, serverName);
     if (!server) {
-      res.status(404).json({
-        success: false,
-        message: 'Server not found',
-      });
       return;
     }
+
+    const serverDao = getServerDao();
 
     // Initialize prompts config if it doesn't exist
     const prompts = server.prompts || {};
@@ -1608,7 +2490,11 @@ export const updatePromptDescription = async (req: Request, res: Response): Prom
     const promptName = decodeURIComponent(req.params.promptName);
     const { description } = req.body;
 
-    if (!serverName || !promptName) {
+    if (
+      !serverName ||
+      !promptName ||
+      ['__proto__', 'constructor', 'prototype'].includes(promptName)
+    ) {
       res.status(400).json({
         success: false,
         message: 'Server name and prompt name are required',
@@ -1624,16 +2510,12 @@ export const updatePromptDescription = async (req: Request, res: Response): Prom
       return;
     }
 
-    const serverDao = getServerDao();
-    const server = await serverDao.findById(serverName);
-
+    const server = await loadAuthorizedServer(req, res, serverName);
     if (!server) {
-      res.status(404).json({
-        success: false,
-        message: 'Server not found',
-      });
       return;
     }
+
+    const serverDao = getServerDao();
 
     // Initialize prompts config if it doesn't exist
     const prompts = server.prompts || {};
@@ -1675,7 +2557,11 @@ export const resetPromptDescription = async (req: Request, res: Response): Promi
     const serverName = decodeURIComponent(req.params.serverName);
     const promptName = decodeURIComponent(req.params.promptName);
 
-    if (!serverName || !promptName) {
+    if (
+      !serverName ||
+      !promptName ||
+      ['__proto__', 'constructor', 'prototype'].includes(promptName)
+    ) {
       res.status(400).json({
         success: false,
         message: 'Server name and prompt name are required',
@@ -1683,16 +2569,12 @@ export const resetPromptDescription = async (req: Request, res: Response): Promi
       return;
     }
 
-    const serverDao = getServerDao();
-    const server = await serverDao.findById(serverName);
-
+    const server = await loadAuthorizedServer(req, res, serverName);
     if (!server) {
-      res.status(404).json({
-        success: false,
-        message: 'Server not found',
-      });
       return;
     }
+
+    const serverDao = getServerDao();
 
     const prompts = clearDescriptionOverride(server.prompts || {}, promptName);
     const result = await serverDao.updatePrompts(serverName, prompts);
@@ -1734,7 +2616,11 @@ export const toggleResource = async (req: Request, res: Response): Promise<void>
     const resourceUri = decodeURIComponent(req.params.resourceUri);
     const { enabled } = req.body;
 
-    if (!serverName || !resourceUri) {
+    if (
+      !serverName ||
+      !resourceUri ||
+      ['__proto__', 'constructor', 'prototype'].includes(resourceUri)
+    ) {
       res.status(400).json({
         success: false,
         message: 'Server name and resource URI are required',
@@ -1750,16 +2636,12 @@ export const toggleResource = async (req: Request, res: Response): Promise<void>
       return;
     }
 
-    const serverDao = getServerDao();
-    const server = await serverDao.findById(serverName);
-
+    const server = await loadAuthorizedServer(req, res, serverName);
     if (!server) {
-      res.status(404).json({
-        success: false,
-        message: 'Server not found',
-      });
       return;
     }
+
+    const serverDao = getServerDao();
 
     // Initialize resources config if it doesn't exist
     const resources = server.resources || {};
@@ -1801,7 +2683,11 @@ export const updateResourceDescription = async (req: Request, res: Response): Pr
     const resourceUri = decodeURIComponent(req.params.resourceUri);
     const { description } = req.body;
 
-    if (!serverName || !resourceUri) {
+    if (
+      !serverName ||
+      !resourceUri ||
+      ['__proto__', 'constructor', 'prototype'].includes(resourceUri)
+    ) {
       res.status(400).json({
         success: false,
         message: 'Server name and resource URI are required',
@@ -1817,16 +2703,12 @@ export const updateResourceDescription = async (req: Request, res: Response): Pr
       return;
     }
 
-    const serverDao = getServerDao();
-    const server = await serverDao.findById(serverName);
-
+    const server = await loadAuthorizedServer(req, res, serverName);
     if (!server) {
-      res.status(404).json({
-        success: false,
-        message: 'Server not found',
-      });
       return;
     }
+
+    const serverDao = getServerDao();
 
     // Initialize resources config if it doesn't exist
     const resources = server.resources || {};
@@ -1868,7 +2750,11 @@ export const resetResourceDescription = async (req: Request, res: Response): Pro
     const serverName = decodeURIComponent(req.params.serverName);
     const resourceUri = decodeURIComponent(req.params.resourceUri);
 
-    if (!serverName || !resourceUri) {
+    if (
+      !serverName ||
+      !resourceUri ||
+      ['__proto__', 'constructor', 'prototype'].includes(resourceUri)
+    ) {
       res.status(400).json({
         success: false,
         message: 'Server name and resource URI are required',
@@ -1876,16 +2762,12 @@ export const resetResourceDescription = async (req: Request, res: Response): Pro
       return;
     }
 
-    const serverDao = getServerDao();
-    const server = await serverDao.findById(serverName);
-
+    const server = await loadAuthorizedServer(req, res, serverName);
     if (!server) {
-      res.status(404).json({
-        success: false,
-        message: 'Server not found',
-      });
       return;
     }
+
+    const serverDao = getServerDao();
 
     const resources = clearDescriptionOverride(server.resources || {}, resourceUri);
     const result = await serverDao.updateResources(serverName, resources);

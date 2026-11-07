@@ -1,6 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
-import { loadSettings } from '../config/index.js';
 import defaultConfig from '../config/index.js';
 import { JWT_SECRET } from '../config/jwt.js';
 import { getToken } from '../models/OAuth.js';
@@ -10,6 +9,7 @@ import { BearerKey, SystemConfig } from '../types/index.js';
 import { getBetterAuthRuntimeConfig } from '../services/betterAuthConfig.js';
 import { safeCompare } from '../utils/safeCompare.js';
 import { getBearerTokenFromHeaders } from '../utils/bearerAuth.js';
+import { logger } from '../utils/logger.js';
 
 const isTestEnv =
   process.env.NODE_ENV === 'test' ||
@@ -25,10 +25,13 @@ const resolveBetterAuthUserSafe = async (req: Request) => {
   return module.resolveBetterAuthUser(req);
 };
 
-const validateBearerAuth = async (req: Request, systemConfig?: SystemConfig | null): Promise<boolean> => {
+const validateBearerAuth = async (
+  req: Request,
+  systemConfig?: SystemConfig | null,
+): Promise<BearerKey | null> => {
   const enableBearerAuth = systemConfig?.routing?.enableBearerAuth ?? true;
   if (!enableBearerAuth) {
-    return false;
+    return null;
   }
 
   const bearerKeyDao = getBearerKeyDao();
@@ -36,24 +39,36 @@ const validateBearerAuth = async (req: Request, systemConfig?: SystemConfig | nu
 
   // If there are no enabled keys, bearer auth via static keys is disabled
   if (enabledKeys.length === 0) {
-    return false;
+    return null;
   }
 
   const token = getBearerTokenFromHeaders(req.headers, systemConfig);
   if (!token) {
-    return false;
+    return null;
   }
 
-  const matchingKey: BearerKey | undefined = enabledKeys.find((key) => safeCompare(key.token, token));
+  const matchingKey: BearerKey | undefined = enabledKeys.find((key) =>
+    safeCompare(key.token, token),
+  );
   if (!matchingKey) {
-    console.warn('Bearer auth failed: token did not match any configured bearer key');
-    return false;
+    logger.warn('Bearer auth failed: token did not match any configured bearer key');
+    return null;
   }
 
-  console.log(
+  // Dashboard/API bearer authentication grants access to non-MCP management routes.
+  // Scoped keys are enforced on MCP routes in sseService.ts and must not bypass
+  // dashboard API authorization.
+  if (matchingKey.kind === 'user' || matchingKey.accessType !== 'all') {
+    logger.warn(
+      `Bearer auth denied for dashboard API: key id=${matchingKey.id}, name=${matchingKey.name} is not a system-level all-access key`,
+    );
+    return null;
+  }
+
+  logger.log(
     `Bearer auth succeeded with key id=${matchingKey.id}, name=${matchingKey.name}, accessType=${matchingKey.accessType}`,
   );
-  return true;
+  return matchingKey;
 };
 
 const readonlyAllowPaths = ['/tools/'];
@@ -72,6 +87,23 @@ const checkReadonly = (req: Request): boolean => {
   return req.method === 'GET';
 };
 
+const createSkipAuthUser = () => ({
+  username: 'guest',
+  isAdmin: true,
+  credentialEligible: false,
+});
+
+const isDashboardApiRequest = (req: Request): boolean => {
+  const basePath = defaultConfig.basePath || '';
+  const apiPrefix = `${basePath}/api`;
+
+  return (
+    req.baseUrl === apiPrefix ||
+    req.originalUrl === apiPrefix ||
+    req.originalUrl.startsWith(`${apiPrefix}/`)
+  );
+};
+
 // Middleware to authenticate JWT token
 export const auth = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   const t = (req as any).t;
@@ -80,21 +112,30 @@ export const auth = async (req: Request, res: Response, next: NextFunction): Pro
     return;
   }
 
-  // Check if authentication is disabled globally
+  // Authentication policy must reflect updates made by other DB instances.
   const systemConfig = await getSystemConfigDao().get();
-  const routingConfig = systemConfig?.routing || loadSettings().systemConfig?.routing || {
+  const routingConfig = systemConfig?.routing || {
     enableGlobalRoute: true,
     enableGroupNameRoute: true,
     skipAuth: false,
   };
 
-  if (routingConfig.skipAuth) {
-    next();
+  // Check if bearer auth via configured keys can validate this request
+  let matchingBearerKey: BearerKey | null = null;
+  try {
+    matchingBearerKey = await validateBearerAuth(req, systemConfig);
+  } catch (error) {
+    next(error as Error);
     return;
   }
 
-  // Check if bearer auth via configured keys can validate this request
-  if (await validateBearerAuth(req, systemConfig)) {
+  if (matchingBearerKey) {
+    (req as any).user = {
+      username: matchingBearerKey.owner || 'system',
+      isAdmin: true,
+      credentialEligible: false,
+    };
+    (req as any).bearerKey = matchingBearerKey;
     next();
     return;
   }
@@ -120,7 +161,7 @@ export const auth = async (req: Request, res: Response, next: NextFunction): Pro
     }
   }
 
-  const betterAuthConfig = getBetterAuthRuntimeConfig();
+  const betterAuthConfig = await getBetterAuthRuntimeConfig(systemConfig);
   if (betterAuthConfig.enabled) {
     const betterAuthUser = await resolveBetterAuthUserSafe(req);
     if (betterAuthUser) {
@@ -137,6 +178,12 @@ export const auth = async (req: Request, res: Response, next: NextFunction): Pro
   const headerToken = req.header('x-auth-token');
   const queryToken = req.query.token as string;
   const token = headerToken || queryToken;
+
+  if (!token && routingConfig.skipAuth && isDashboardApiRequest(req)) {
+    (req as any).user = createSkipAuthUser();
+    next();
+    return;
+  }
 
   // Check if no token
   if (!token) {

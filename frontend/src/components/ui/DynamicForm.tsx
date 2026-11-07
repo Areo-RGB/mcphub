@@ -190,13 +190,22 @@ const DynamicForm: React.FC<DynamicFormProps> = ({
       let current = newValues;
 
       for (let i = 0; i < keys.length - 1; i++) {
-        if (!current[keys[i]]) {
-          current[keys[i]] = {};
+        const key = keys[i];
+        if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+          return prev;
         }
-        current = current[keys[i]];
+        if (!current[key]) {
+          current[key] = {};
+        }
+        current = current[key];
       }
 
-      current[keys[keys.length - 1]] = value;
+      const lastKey = keys[keys.length - 1];
+      if (!lastKey || lastKey === '__proto__' || lastKey === 'constructor' || lastKey === 'prototype') {
+        return prev;
+      }
+
+      current[lastKey] = value;
 
       // Save to localStorage if storageKey is provided
       if (storageKey) {
@@ -387,9 +396,9 @@ const DynamicForm: React.FC<DynamicFormProps> = ({
             <p className="text-xs text-gray-500 mb-2">{propSchema.description}</p>
           )}
 
-          <div className="border border-gray-200 rounded-md p-3 bg-gray-50">
+          <div className="border border-gray-200 dark:border-gray-700 rounded-md p-3 bg-gray-50 dark:bg-gray-800">
             {arrayValue.map((item: any, index: number) => (
-              <div key={index} className="mb-3 p-3 bg-white border border-gray-200 rounded-md">
+              <div key={index} className="mb-3 p-3 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-md">
                 <div className="flex justify-between items-center mb-2">
                   <span className="text-sm font-medium text-gray-600">
                     {t('tool.item', { index: index + 1 })}
@@ -491,7 +500,7 @@ const DynamicForm: React.FC<DynamicFormProps> = ({
               <p className="text-xs text-gray-500 mb-2">{propSchema.description}</p>
             )}
 
-            <div className="border border-gray-200 rounded-md p-4 bg-gray-50">
+            <div className="border border-gray-200 dark:border-gray-700 rounded-md p-4 bg-gray-50 dark:bg-gray-800">
               {Object.entries(propSchema.properties).map(([objKey, objSchema]) =>
                 renderField(objKey, objSchema as JsonSchema, fullPath),
               )}
@@ -669,20 +678,20 @@ const DynamicForm: React.FC<DynamicFormProps> = ({
 
   if (!jsonSchema.properties) {
     return (
-      <div className="p-4 bg-gray-50 rounded-md">
+      <div className="p-4 bg-gray-50 dark:bg-gray-800 rounded-md">
         <p className="text-sm text-gray-600">{t('tool.noParameters')}</p>
         <div className="flex justify-end space-x-2 mt-4">
           <button
             type="button"
             onClick={onCancel}
-            className="px-4 py-2 text-sm text-gray-600 bg-gray-100 rounded-md hover:bg-gray-200"
+            className="hub-btn"
           >
             {t('tool.cancel')}
           </button>
           <button
             onClick={() => onSubmit({})}
             disabled={loading}
-            className="px-4 py-2 text-sm text-white bg-blue-600 rounded-md hover:bg-blue-700 disabled:opacity-50"
+            className="hub-btn primary"
           >
             {loading ? t('tool.running') : t('tool.runTool')}
           </button>
@@ -700,10 +709,8 @@ const DynamicForm: React.FC<DynamicFormProps> = ({
           <button
             type="button"
             onClick={switchToFormMode}
-            className={`px-3 py-1 text-sm rounded-md transition-colors ${
-              !isJsonMode
-                ? 'bg-blue-100 text-blue-800 rounded hover:bg-blue-200 text-sm btn-primary'
-                : 'text-sm text-gray-600 bg-gray-200 rounded hover:bg-gray-300 btn-secondary'
+            className={`hub-btn sm ${
+              !isJsonMode ? 'primary' : ''
             }`}
           >
             {t('tool.formMode')}
@@ -711,10 +718,8 @@ const DynamicForm: React.FC<DynamicFormProps> = ({
           <button
             type="button"
             onClick={switchToJsonMode}
-            className={`px-3 py-1 text-sm rounded-md transition-colors ${
-              isJsonMode
-                ? 'px-4 py-1 bg-blue-100 text-blue-800 rounded hover:bg-blue-200 text-sm btn-primary'
-                : 'text-sm text-gray-600 bg-gray-200 rounded hover:bg-gray-300 btn-secondary'
+            className={`hub-btn sm ${
+              isJsonMode ? 'primary' : ''
             }`}
           >
             {t('tool.jsonMode')}
@@ -744,7 +749,7 @@ const DynamicForm: React.FC<DynamicFormProps> = ({
             <button
               type="button"
               onClick={onCancel}
-              className="px-4 py-1 text-sm text-gray-600 bg-gray-200 rounded hover:bg-gray-300 btn-secondary"
+              className="hub-btn sm"
             >
               {t('tool.cancel')}
             </button>
@@ -758,7 +763,7 @@ const DynamicForm: React.FC<DynamicFormProps> = ({
                 }
               }}
               disabled={loading || !!jsonError}
-              className="px-4 py-1 bg-blue-100 text-blue-800 rounded hover:bg-blue-200 text-sm btn-primary"
+              className="hub-btn sm primary"
             >
               {loading ? t('tool.running') : t('tool.runTool')}
             </button>
@@ -775,14 +780,14 @@ const DynamicForm: React.FC<DynamicFormProps> = ({
             <button
               type="button"
               onClick={onCancel}
-              className="px-4 py-1 text-sm text-gray-600 bg-gray-200 rounded hover:bg-gray-300 btn-secondary"
+              className="hub-btn sm"
             >
               {t('tool.cancel')}
             </button>
             <button
               type="submit"
               disabled={loading}
-              className="px-4 py-1 bg-blue-100 text-blue-800 rounded hover:bg-blue-200 text-sm btn-primary"
+              className="hub-btn sm primary"
             >
               {loading ? t('tool.running') : t('tool.runTool')}
             </button>

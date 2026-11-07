@@ -1,18 +1,21 @@
-FROM python:3.13-slim-bookworm AS base
+# syntax=docker/dockerfile:1.7
+
+FROM python:3.13-slim-trixie AS base
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-RUN apt-get update && apt-get install -y curl gnupg git build-essential \
+# procps provides `ps`, which tree-kill needs to walk stdio process trees
+# (missing it caused spawn ps ENOENT crashes — issue #1072)
+RUN apt-get update && apt-get install -y curl gnupg git build-essential procps \
   && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
   && apt-get install -y nodejs \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g pnpm
+RUN corepack enable && corepack prepare pnpm@10.12.4 --activate
 
-ENV PNPM_HOME=/usr/local/share/pnpm
-ENV PATH=$PNPM_HOME:$PATH
-RUN mkdir -p $PNPM_HOME && \
-  pnpm add -g @amap/amap-maps-mcp-server @playwright/mcp@latest tavily-mcp@latest @modelcontextprotocol/server-github @modelcontextprotocol/server-slack
+ENV RUSTUP_HOME=/usr/local/rustup \
+  CARGO_HOME=/usr/local/cargo \
+  PATH=/usr/local/cargo/bin:$PATH
 
 ARG INSTALL_EXT=false
 RUN if [ "$INSTALL_EXT" = "true" ]; then \
@@ -22,13 +25,15 @@ RUN if [ "$INSTALL_EXT" = "true" ]; then \
   else \
   echo "Skipping Chrome and Firefox installation on non-amd64 architecture: $ARCH"; \
   fi; \
-  # Install Docker Engine (includes CLI and daemon) \
+  # Install Rust toolchain and Docker Engine (includes CLI and daemon) \
   apt-get update && \
   apt-get install -y ca-certificates curl iptables && \
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal && \
+  cargo --version && rustc --version && \
   install -m 0755 -d /etc/apt/keyrings && \
   curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc && \
   chmod a+r /etc/apt/keyrings/docker.asc && \
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null && \
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null && \
   apt-get update && \
   apt-get install -y docker-ce docker-ce-cli containerd.io && \
   apt-get clean && rm -rf /var/lib/apt/lists/*; \
@@ -39,14 +44,19 @@ RUN uv tool install mcp-server-fetch
 WORKDIR /app
 
 COPY package.json pnpm-lock.yaml ./
-RUN pnpm install
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
+  pnpm config set store-dir /pnpm/store && pnpm fetch --frozen-lockfile
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
+  pnpm config set store-dir /pnpm/store && pnpm install --frozen-lockfile --offline
 
 COPY . .
 
 # Download the latest servers.json from mcpm.sh and replace the existing file
 RUN curl -s -f --connect-timeout 10 https://mcpm.sh/api/servers.json -o servers.json || echo "Failed to download servers.json, using bundled version"
 
-RUN pnpm frontend:build && pnpm build
+RUN pnpm build
+# Keep the legacy path available only for user-mounted configuration.
+RUN rm /app/mcp_settings.json
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
@@ -54,4 +64,8 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 EXPOSE 3000
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["pnpm", "start"]
+# Launch node directly instead of `pnpm start`: the pnpm shim resolves via
+# Corepack, which re-downloads pnpm into the runtime user's HOME cache when the
+# image runs as a non-root user, breaking startup in egress-restricted
+# environments (#1105).
+CMD ["node", "dist/index.js"]

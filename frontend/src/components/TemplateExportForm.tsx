@@ -73,7 +73,7 @@ const TemplateExportForm: React.FC<TemplateExportFormProps> = ({ groups, onCance
 
   return (
     <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-      <div className="bg-white shadow rounded-lg p-6 w-full max-w-3xl max-h-[90vh] overflow-y-auto">
+      <div className="bg-white dark:bg-gray-800 shadow rounded-lg p-6 w-full max-w-3xl max-h-[90vh] overflow-y-auto">
         <div className="flex justify-between items-center mb-6">
           <h2 className="text-xl font-semibold text-gray-900">{t('template.exportTitle')}</h2>
           <button onClick={onCancel} className="text-gray-500 hover:text-gray-700">
@@ -129,11 +129,11 @@ const TemplateExportForm: React.FC<TemplateExportFormProps> = ({ groups, onCance
               </button>
             </div>
             <p className="text-xs text-gray-500 mb-2">{t('template.selectGroupsHelp')}</p>
-            <div className="border border-gray-200 rounded-md max-h-48 overflow-y-auto">
+            <div className="border border-gray-200 dark:border-gray-700 rounded-md max-h-48 overflow-y-auto">
               {groups.map((group) => (
                 <label
                   key={group.id}
-                  className="flex items-center px-3 py-2 hover:bg-gray-50 cursor-pointer"
+                  className="flex items-center px-3 py-2 hover:bg-gray-50 dark:bg-gray-800 dark:hover:bg-gray-700 cursor-pointer"
                 >
                   <input
                     type="checkbox"
@@ -170,14 +170,14 @@ const TemplateExportForm: React.FC<TemplateExportFormProps> = ({ groups, onCance
         <div className="flex justify-end space-x-4 mt-6">
           <button
             onClick={onCancel}
-            className="px-4 py-2 text-gray-700 bg-gray-200 rounded hover:bg-gray-300 btn-secondary"
+            className="hub-btn"
           >
             {t('common.cancel')}
           </button>
           <button
             onClick={handleExport}
             disabled={isExporting || !name.trim()}
-            className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed btn-primary"
+            className="hub-btn primary"
           >
             {isExporting ? t('template.exporting') : t('template.export')}
           </button>

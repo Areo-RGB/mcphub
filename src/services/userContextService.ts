@@ -1,33 +1,11 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { IUser } from '../types/index.js';
-
-// User context storage
-class UserContext {
-  private static instance: UserContext;
-  private currentUser: IUser | null = null;
-
-  static getInstance(): UserContext {
-    if (!UserContext.instance) {
-      UserContext.instance = new UserContext();
-    }
-    return UserContext.instance;
-  }
-
-  setUser(user: IUser): void {
-    this.currentUser = user;
-  }
-
-  getUser(): IUser | null {
-    return this.currentUser;
-  }
-
-  clearUser(): void {
-    this.currentUser = null;
-  }
-}
 
 export class UserContextService {
   private static instance: UserContextService;
-  private userContext = UserContext.getInstance();
+  private readonly asyncLocalStorage = new AsyncLocalStorage<{ currentUser: IUser | null }>();
+
+  private constructor() {}
 
   static getInstance(): UserContextService {
     if (!UserContextService.instance) {
@@ -37,15 +15,31 @@ export class UserContextService {
   }
 
   getCurrentUser(): IUser | null {
-    return this.userContext.getUser();
+    return this.asyncLocalStorage.getStore()?.currentUser ?? null;
   }
 
   setCurrentUser(user: IUser): void {
-    this.userContext.setUser(user);
+    const store = this.asyncLocalStorage.getStore();
+    if (store) {
+      store.currentUser = user;
+      return;
+    }
+
+    this.asyncLocalStorage.enterWith({ currentUser: user });
   }
 
   clearCurrentUser(): void {
-    this.userContext.clearUser();
+    const store = this.asyncLocalStorage.getStore();
+    if (store) {
+      store.currentUser = null;
+      return;
+    }
+
+    this.asyncLocalStorage.enterWith({ currentUser: null });
+  }
+
+  runWithContext<T>(callback: () => T, initialUser: IUser | null = null): T {
+    return this.asyncLocalStorage.run({ currentUser: initialUser }, callback);
   }
 
   isAdmin(): boolean {

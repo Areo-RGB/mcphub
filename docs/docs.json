@@ -2,7 +2,7 @@
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
   "name": "MCPHub Documentation",
-  "description": "The Unified Hub for Model Context Protocol (MCP) Servers",
+  "description": "Open-source, self-hosted MCP gateway and control plane for connecting, controlling, and operating MCP servers.",
   "colors": {
     "primary": "#16A34A",
     "light": "#07C983",
@@ -26,9 +26,14 @@
             "group": "Core Features",
             "pages": [
               "features/server-management",
+              "features/per-user-credentials",
               "features/group-management",
               "features/smart-routing",
-              "features/oauth"
+              "features/mcp-apps",
+              "features/oauth",
+              "features/authentication",
+              "features/monitoring",
+              "features/cli"
             ]
           },
           {
@@ -39,6 +44,16 @@
               "configuration/docker-setup",
               "configuration/nginx",
               "configuration/database-configuration"
+            ]
+          },
+          {
+            "group": "Development",
+            "pages": [
+              "development",
+              "development/getting-started",
+              "development/architecture",
+              "development/embedding-lifecycle",
+              "development/contributing"
             ]
           }
         ]
@@ -58,9 +73,14 @@
             "group": "核心功能",
             "pages": [
               "zh/features/server-management",
+              "zh/features/per-user-credentials",
               "zh/features/group-management",
               "zh/features/smart-routing",
-              "zh/features/oauth"
+              "zh/features/mcp-apps",
+              "zh/features/oauth",
+              "zh/features/authentication",
+              "zh/features/monitoring",
+              "zh/features/cli"
             ]
           },
           {
@@ -168,7 +188,7 @@
   "footer": {
     "socials": {
       "github": "https://github.com/samanhappy/mcphub",
-      "discord": "https://discord.gg/qMKNsn5Q"
+      "discord": "https://discord.gg/2BJehJZVH5"
     }
   }
 }

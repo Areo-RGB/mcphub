@@ -9,7 +9,8 @@ import {
 // Export full configuration template
 export const exportConfigTemplate = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { name, description, groupIds, includeDisabledServers } = req.body as TemplateExportOptions;
+    const { name, description, groupIds, includeDisabledServers } =
+      req.body as TemplateExportOptions;
 
     if (!name) {
       res.status(400).json({
@@ -24,6 +25,7 @@ export const exportConfigTemplate = async (req: Request, res: Response): Promise
       description,
       groupIds,
       includeDisabledServers: includeDisabledServers ?? false,
+      requestingUser: (req as any).user,
     });
 
     res.json({
@@ -52,7 +54,11 @@ export const exportGroupAsTemplate = async (req: Request, res: Response): Promis
       return;
     }
 
-    const template = await exportGroupTemplate(id, name as string | undefined);
+    const template = await exportGroupTemplate(
+      id,
+      name as string | undefined,
+      (req as any).user,
+    );
 
     if (!template) {
       res.status(404).json({
@@ -90,7 +96,7 @@ export const importConfigTemplate = async (req: Request, res: Response): Promise
     const currentUser = (req as any).user;
     const owner = currentUser?.username || 'admin';
 
-    const result = await importTemplate(template, owner);
+    const result = await importTemplate(template, owner, currentUser);
 
     const statusCode = result.success ? 200 : 400;
     res.status(statusCode).json({

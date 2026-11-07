@@ -10,10 +10,14 @@ export interface IUser {
   username: string;
   password: string;
   isAdmin?: boolean;
+  email?: string | null;
+  ssoUserId?: string | null;
 }
 
 // Group interface for server grouping
 export interface IGroup {
+  visibility?: 'private' | 'group' | 'public';
+  sharedWithUsers?: string[];
   id: string; // Unique UUID for the group
   name: string; // Display name of the group
   description?: string; // Optional description of the group
@@ -24,6 +28,7 @@ export interface IGroup {
 // Server configuration within a group - supports tool selection
 export interface IGroupServerConfig {
   name: string; // Server name
+  alias?: string; // Optional exposed name for this server within the group
   tools?: string[] | 'all'; // Array of specific tool names to include, or 'all' for all tools (default: 'all')
   prompts?: string[] | 'all'; // Array of specific prompt names to include, or 'all' for all prompts (default: 'all')
   resources?: string[] | 'all'; // Array of specific resource URIs to include, or 'all' for all resources (default: 'all')
@@ -81,6 +86,37 @@ export interface MarketServer {
   arguments: Record<string, MarketServerArgument>;
   tools: MarketServerTool[];
   is_official?: boolean;
+}
+
+export type ChangelogCategory = 'feature' | 'fix' | 'breaking' | 'security';
+
+export interface ChangelogEntry {
+  product: 'mcphub';
+  version: string;
+  tagName: string;
+  publishedAt: string;
+  url: string;
+  changelogUrl: string;
+  title: string;
+  summary: string;
+  highlights: string[];
+  fixes: string[];
+  breakingChanges: string[];
+  upgradeNotes: string[];
+  categories: ChangelogCategory[];
+  locale: 'en' | 'zh';
+  bodyMarkdown: string;
+  isStructured: boolean;
+}
+
+export interface ChangelogUpdateInfo {
+  latestVersion: string | null;
+  hasUpdate: boolean;
+  entries: ChangelogEntry[];
+  totalUpdateCount: number;
+  changelogUrl: string;
+  allChangelogUrl: string;
+  source: 'mcphub-web' | 'npm-fallback' | 'disabled';
 }
 
 // Cloud Market Server types (for MCPRouter API)
@@ -155,13 +191,41 @@ export interface BetterAuthProviderToggle {
   enabled?: boolean; // Enable/disable the provider
 }
 
+export interface BetterAuthOidcProviderConfig extends BetterAuthProviderToggle {
+  providerId?: string; // Provider identifier used by Better Auth generic OAuth plugin
+  discoveryUrl?: string; // OIDC discovery URL for a local issuer
+  scopes?: string[]; // Requested scopes for login
+  pkce?: boolean; // Enable/disable PKCE for the provider
+  prompt?:
+    | 'none'
+    | 'login'
+    | 'create'
+    | 'consent'
+    | 'select_account'
+    | 'select_account consent'
+    | 'login consent';
+}
+
 export interface BetterAuthConfig {
   enabled?: boolean; // Enable/disable Better Auth integration
+  baseUrl?: string; // Public base URL used to build Better Auth redirect URIs
   basePath?: string; // Base path to mount Better Auth handler
+  trustedOrigins?: string[]; // Explicitly trusted origins for social/OIDC login requests
+  disableAutoCreate?: boolean; // When true, SSO login will not auto-create new users
   providers?: {
     google?: BetterAuthProviderToggle;
     github?: BetterAuthProviderToggle;
+    oidc?: BetterAuthOidcProviderConfig;
   };
+}
+
+export type ToolResultCompressionStrategy = 'auto' | 'json' | 'log' | 'search' | 'diff' | 'text';
+
+export interface ToolResultCompressionConfig {
+  enabled?: boolean;
+  minTokens?: number;
+  maxOutputTokens?: number;
+  strategy?: ToolResultCompressionStrategy;
 }
 
 export interface SystemConfig {
@@ -178,8 +242,10 @@ export interface SystemConfig {
     pythonIndexUrl?: string; // Python package repository URL (UV_DEFAULT_INDEX)
     npmRegistry?: string; // NPM registry URL (npm_config_registry)
     baseUrl?: string; // Base URL for group card copy operations
+    publicBaseUrl?: string; // Public URL (e.g. a tunnel) offered as an extra copy target on server/group cards
   };
   smartRouting?: SmartRoutingConfig;
+  toolResultCompression?: ToolResultCompressionConfig;
   mcpRouter?: {
     apiKey?: string; // MCPRouter API key for authentication
     referer?: string; // Referer header for MCPRouter API requests
@@ -192,6 +258,20 @@ export interface SystemConfig {
   enableSessionRebuild?: boolean; // Controls whether server session rebuild is enabled
   auth?: {
     betterAuth?: BetterAuthConfig; // Better Auth integration configuration
+  };
+  discovery?: {
+    // Public unauthenticated read-only discovery API for the local market catalog.
+    // When enabled, exposes /discovery/servers and /.well-known/mcp-marketplace so
+    // external MCP clients (e.g. OpenClaw, Claude Desktop installers) can find and
+    // install servers programmatically. Off by default to avoid leaking catalog data.
+    enabled?: boolean;
+  };
+  activityLog?: {
+    // Whether to persist the full tool call input/output payload in activity logs.
+    // Tool payloads are stored verbatim (no field-level redaction); deployments that
+    // treat tool arguments as sensitive can turn this off to store metadata only.
+    // Defaults to true.
+    storeToolPayload?: boolean;
   };
 }
 
@@ -209,6 +289,7 @@ export interface IOAuthClient {
   grants: string[]; // Allowed grant types (e.g., ['authorization_code', 'refresh_token'])
   scopes?: string[]; // Allowed scopes for this client
   owner?: string; // Owner of the OAuth client, defaults to 'admin' user
+  clientIdIssuedAt?: number; // Unix timestamp (seconds) when the client was registered (RFC 7591 client_id_issued_at)
   metadata?: {
     // RFC 7591 Client Metadata
     application_type?: 'web' | 'native'; // Application type
@@ -260,17 +341,28 @@ export interface OAuthServerConfig {
     enabled?: boolean; // Enable/disable RFC 7591 dynamic client registration
     allowedGrantTypes?: string[]; // Allowed grant types for dynamic registration (default: ['authorization_code', 'refresh_token'])
     requiresAuthentication?: boolean; // Whether initial registration requires authentication (default: false for public registration)
+    clientTtl?: number; // Idle-client cleanup TTL in seconds. Dynamically-registered clients with no live token and no in-progress authorization flow older than this are reaped (default: 2592000 = 30 days; 0 disables cleanup)
+  };
+  clientIdMetadata?: {
+    // Client ID Metadata Documents (CIMD, draft-ietf-oauth-client-id-metadata-document):
+    // accept HTTPS-URL-shaped client_ids whose metadata is fetched from the URL itself.
+    // Opt-in (default false) because it makes the authorize endpoint fetch attacker-chosen URLs.
+    enabled?: boolean;
+    cacheTtlMs?: number; // Metadata document cache TTL in milliseconds (default: 3600000)
   };
 }
 
 // Bearer authentication key configuration
 export type BearerKeyAccessType = 'all' | 'groups' | 'servers' | 'custom';
+export type BearerKeyKind = 'system' | 'user';
 
 export interface BearerKey {
   id: string; // Unique identifier for the key
   name: string; // Human readable key name
   token: string; // Bearer token value
   enabled: boolean; // Whether this key is enabled
+  kind?: BearerKeyKind; // Defaults to 'system' for keys created before user-level keys existed
+  owner?: string; // Required for user-level keys
   accessType: BearerKeyAccessType; // Access scope type
   allowedGroups?: string[]; // Allowed group names when accessType === 'groups' or 'custom'
   allowedServers?: string[]; // Allowed server names when accessType === 'servers' or 'custom'
@@ -303,8 +395,27 @@ export interface ProxychainsConfig {
   configPath?: string; // Path to custom proxychains4 configuration file (optional, overrides above settings)
 }
 
+// Visibility level for a server, used by non-admin filtering. See issue #817.
+// 'group' is restricted sharing for explicitly selected users. Group membership
+// can extend the same scope in a future change.
+export type ServerVisibility = 'private' | 'group' | 'public';
+
+export interface CredentialSlot {
+  target: 'env' | 'headers';
+  name: string;
+  label?: string;
+}
+
+export interface StoredCredentialBinding {
+  serverName: string;
+  username: string;
+  encryptedValues: string;
+  updatedAt: string;
+}
+
 // Configuration details for an individual server
 export interface ServerConfig {
+  credentialTemplate?: CredentialSlot[]; // Metadata only; every slot requires a personal binding.
   type?: 'stdio' | 'sse' | 'streamable-http' | 'openapi'; // Type of server
   description?: string; // Optional server note/description for management UI
   url?: string; // URL for SSE or streamable HTTP servers
@@ -315,12 +426,28 @@ export interface ServerConfig {
   passthroughHeaders?: string[]; // Header names to pass through from MCP requests to upstream SSE/streamable-http servers
   enabled?: boolean; // Flag to enable/disable the server
   owner?: string; // Owner of the server, defaults to 'admin' user
-  enableKeepAlive?: boolean; // Enable keep-alive for this server (requires global enable as well)
-  keepAliveInterval?: number; // Keep-alive ping interval in milliseconds (default: 60000ms for SSE servers)
+  // Per-server visibility for non-admin users.
+  //   'private' — only the owner (or admins) can see this server. Default.
+  //   'public'  — every authenticated user can see this server.
+  //   'group'   — explicitly selected users can see this server.
+  // See issues #817 and #1037.
+  visibility?: ServerVisibility;
+  sharedWithUsers?: string[]; // Local MCPHub usernames allowed when visibility is 'group'.
+  enableKeepAlive?: boolean; // Enable remote health checks and automatic reconnect attempts
+  keepAliveInterval?: number; // Health check and reconnect interval in milliseconds (default: 60000ms for SSE servers)
   tools?: Record<string, { enabled: boolean; description?: string }>; // Tool-specific configurations with enable/disable state and custom descriptions
   prompts?: Record<string, { enabled: boolean; description?: string }>; // Prompt-specific configurations with enable/disable state and custom descriptions
   resources?: Record<string, { enabled: boolean; description?: string }>; // Resource-specific configurations with enable/disable state and custom descriptions
-  options?: Partial<Pick<RequestOptions, 'timeout' | 'resetTimeoutOnProgress' | 'maxTotalTimeout'>>; // MCP request options configuration
+  options?: Partial<Pick<RequestOptions, 'timeout' | 'resetTimeoutOnProgress' | 'maxTotalTimeout'>> & {
+    // Internal persistence carriers for startOnDemand/idleTimeoutMs (see below). The
+    // database-backed ServerDao has no dedicated columns for those two fields, so
+    // serverConfigPersistence.ts piggybacks them onto this schema-less JSON blob
+    // and ServerDaoDbImpl unpacks them back to the top-level fields on read.
+    // Application code should read/write config.startOnDemand / config.idleTimeoutMs
+    // directly rather than these mirrored keys.
+    startOnDemand?: boolean;
+    idleTimeoutMs?: number;
+  }; // MCP request options configuration
   // Proxychains4 proxy configuration for STDIO servers (Linux/macOS only, Windows not supported)
   proxy?: ProxychainsConfig;
   // OAuth authentication for upstream MCP servers
@@ -328,6 +455,7 @@ export interface ServerConfig {
     // Static client configuration (traditional OAuth flow)
     clientId?: string; // OAuth client ID
     clientSecret?: string; // OAuth client secret
+    redirectUri?: string; // Preferred redirect URI for authorization requests and registration
     scopes?: string[]; // Required OAuth scopes
     accessToken?: string; // Pre-obtained access token (if available)
     refreshToken?: string; // Refresh token for renewing access
@@ -364,6 +492,8 @@ export interface ServerConfig {
     authorizationEndpoint?: string;
     // Token endpoint for exchanging authorization codes for tokens
     tokenEndpoint?: string;
+    // Token revocation endpoint for upstream OAuth providers (RFC 7009)
+    revocationEndpoint?: string;
     // Pending OAuth session metadata for PKCE/state recovery between restarts
     pendingAuthorization?: {
       authorizationUrl?: string;
@@ -372,13 +502,28 @@ export interface ServerConfig {
       createdAt?: number;
     };
   };
+  perSessionClient?: boolean; // When true, creates a dedicated upstream client per downstream session (session isolation for stateful servers like Playwright)
+  // On-demand spawning: start the stdio process only when a tool call arrives,
+  // and shut it down automatically after a period of inactivity.
+  // This reduces persistent memory usage for rarely-used servers.
+  // Only effective for stdio-type servers; HTTP/SSE servers are unaffected.
+  startOnDemand?: boolean; // When true, skip startup connect and spawn lazily on first tool call
+  idleTimeoutMs?: number; // Milliseconds of inactivity before shutting down (default: 300_000 = 5 min)
   // OpenAPI specific configuration
   openapi?: {
     url?: string; // OpenAPI specification URL
     schema?: Record<string, any>; // Complete OpenAPI JSON schema
     version?: string; // OpenAPI version (default: '3.1.0')
     security?: OpenAPISecurityConfig; // Security configuration for API calls
+    // Optional credential used ONLY to download the specification document when
+    // the spec endpoint authenticates differently from the API (#1079), e.g.
+    // Basic-protected /v3/api-docs behind a Bearer-protected API. Falls back to
+    // `security` when absent. oauth2/openIdConnect here require a pre-obtained
+    // static token; the dynamic client-credentials flow only exists for
+    // `security`.
+    specSecurity?: OpenAPISecurityConfig;
     passthroughHeaders?: string[]; // Header names to pass through from tool call requests to upstream OpenAPI endpoints
+    cookieSession?: boolean; // Opt-in: capture upstream Set-Cookie and replay on later calls, isolated per downstream MCP session
   };
 }
 
@@ -389,7 +534,7 @@ export interface OpenAPISecurityConfig {
   apiKey?: {
     name: string; // Header/query/cookie name
     in: 'header' | 'query' | 'cookie';
-    value: string; // The API key value
+    value?: string; // The API key value (may be empty until the user supplies it)
   };
   // HTTP authentication (Basic, Bearer, etc.)
   http?: {
@@ -404,6 +549,7 @@ export interface OpenAPISecurityConfig {
     clientSecret?: string;
     scopes?: string[]; // Required scopes
     token?: string; // Pre-obtained access token
+    expiresAt?: number; // Access token expiration timestamp in milliseconds
   };
   // OpenID Connect
   openIdConnect?: {
@@ -417,7 +563,20 @@ export interface OpenAPISecurityConfig {
 // Information about a server's status and tools
 export interface ServerInfo {
   name: string; // Unique name of the server
+  version?: string; // Upstream server version reported during MCP initialization
+  // Resolved package version for stdio servers launched via npx/uvx (see #1166).
+  // Read from the runner's install cache (npm _npx / uv tool environments),
+  // distinct from `version` which is what the server reports about itself.
+  packageVersion?: string;
+  // Newest version the configured registry offers for this npx/uvx package
+  // (see #1166). Only present once the registry has been queried.
+  latestVersion?: string;
+  // True when the registry has a newer version than the installed one.
+  updateAvailable?: boolean;
+  instructions?: string; // Upstream server instructions reported during MCP initialization
   owner?: string; // Owner of the server, defaults to 'admin' user
+  visibility?: ServerVisibility; // Carried over from ServerConfig so dataService.filterData can apply #817 visibility rules at runtime.
+  sharedWithUsers?: string[]; // Carried over for restricted user-sharing authorization.
   status: 'connected' | 'connecting' | 'disconnected' | 'oauth_required'; // Current connection status
   error: string | null; // Error message if any
   tools: Tool[]; // List of tools available on the server
@@ -431,19 +590,36 @@ export interface ServerInfo {
   enabled?: boolean; // Flag to indicate if the server is enabled
   keepAliveIntervalId?: NodeJS.Timeout; // Timer ID for keep-alive ping interval
   config?: ServerConfig; // Reference to the original server configuration for OpenAPI passthrough headers
+  // On-demand spawning runtime state
+  spawningPromise?: Promise<void>; // Singleton promise: concurrent callers await this instead of double-spawning
+  activeToolCalls?: number; // Calls holding the on-demand runtime awake, including cold starts
+  idleTimeoutId?: NodeJS.Timeout; // Timer ID for idle-shutdown (cleared/reset on each tool call)
+  lastUsedAt?: number; // Timestamp of last tool call (ms since epoch)
   oauth?: {
     // OAuth authorization state
     authorizationUrl?: string; // OAuth authorization URL for user to visit
     state?: string; // OAuth state parameter for CSRF protection
-    codeVerifier?: string; // PKCE code verifier
+    connected?: boolean; // True when stored upstream OAuth tokens exist
+    clientIdConfigured?: boolean; // True when a static oauth.clientId is set (dynamic registration is suppressed).
+    // When set, a preconfigured client's redirect-URI allow-list may not include this hub's callback,
+    // causing the upstream authorize endpoint to reject with "invalid redirect_uri". Surfaced so the UI
+    // can hint the user to remove clientId and let MCPHub self-register (DCR).
   };
 }
 
 // Details about a tool available on the server
 export interface Tool {
   name: string; // Name of the tool
+  title?: string; // Human-readable title
   description: string; // Brief description of the tool
+  defaultDescription?: string; // Upstream tool description before any MCPHub override is applied
+  hasDescriptionOverride?: boolean; // Whether MCPHub is currently overriding the upstream description
   inputSchema: Record<string, unknown>; // Input schema for the tool
+  outputSchema?: Record<string, unknown>; // Optional schema for structured output
+  annotations?: Record<string, unknown>; // Standard MCP tool annotations
+  execution?: Record<string, unknown>; // Standard MCP execution metadata
+  icons?: Array<Record<string, unknown>>; // Standard MCP icons
+  _meta?: Record<string, unknown>; // Extension metadata, including MCP Apps metadata
   enabled?: boolean; // Whether the tool is enabled (optional, defaults to true)
 }
 
@@ -465,8 +641,13 @@ export interface PromptArgument {
 export interface Resource {
   uri: string; // Unique URI of the resource (e.g., 'file:///path' or custom scheme)
   name?: string; // Human-readable name
+  title?: string; // Human-readable title
   description?: string; // Brief description of the resource
   mimeType?: string; // MIME type of the resource content
+  size?: number; // Resource size in bytes
+  annotations?: Record<string, unknown>; // Standard MCP resource annotations
+  icons?: Array<Record<string, unknown>>; // Standard MCP icons
+  _meta?: Record<string, unknown>; // Extension metadata, including MCP Apps metadata
 }
 
 // Built-in prompt defined via configuration
@@ -526,6 +707,8 @@ export interface BatchCreateServersResponse {
 
 // Request payload for adding a new group
 export interface AddGroupRequest {
+  visibility?: IGroup['visibility'];
+  sharedWithUsers?: string[];
   name: string; // Name of the group to add
   description?: string; // Optional description of the group
   servers?: string[] | IGroupServerConfig[]; // Array of server names or server configurations
@@ -565,8 +748,10 @@ export interface IActivity {
   input?: string; // JSON stringified input arguments
   output?: string; // JSON stringified output result
   group?: string; // Group name if called via group route
+  username?: string; // Username associated with the request
   keyId?: string; // Bearer key ID if authenticated with bearer token
   keyName?: string; // Bearer key name for display purposes
+  sourceIp?: string; // Source IP address of the caller
   errorMessage?: string; // Error message if status is 'error'
 }
 
@@ -584,6 +769,7 @@ export interface IActivityFilter {
   tool?: string;
   status?: ActivityStatus;
   group?: string;
+  username?: string;
   keyId?: string;
   keyName?: string;
   startDate?: Date;
@@ -621,6 +807,7 @@ export interface TemplateExportOptions {
   description?: string; // Template description
   groupIds?: string[]; // Specific group IDs to export (empty = all)
   includeDisabledServers?: boolean; // Include disabled servers (default: false)
+  requestingUser?: IUser; // Caller identity; non-admins only export what they can see
 }
 
 // Result of importing a template
@@ -640,4 +827,82 @@ export interface TemplateImportDetail {
   name: string;
   action: 'created' | 'skipped' | 'failed';
   message?: string;
+}
+
+// ─── Context Footprint (token cost) feature ───────────────────────────────
+export interface ItemCost {
+  kind: 'tool' | 'prompt' | 'resource';
+  name: string;
+  cost: number;
+  enabled: boolean;
+}
+
+export interface ServerCost {
+  name: string;
+  connected: boolean;
+  exposed: number;
+  gross: number;
+  items: ItemCost[];
+}
+
+export interface SmartRoutingCost {
+  base: number;
+  progressiveDisclosure: number;
+}
+
+export interface GroupCost {
+  id: string;
+  name: string;
+  connectedCount: number;
+  totalCount: number;
+  direct: { exposed: number; gross: number };
+  smartRouting: SmartRoutingCost | null;
+}
+
+/**
+ * The effective security requirement a parsed OpenAPI spec declares (#1077).
+ *
+ * Resolved per OpenAPI 3.x: an operation-level `security` overrides the
+ * root-level one for that operation; `security: []` explicitly disables auth.
+ * A requirement is an OR-list of named schemes from
+ * `components.securitySchemes`; the first alternative MCPHub can represent is
+ * returned as `prefill` with structural fields only — a spec can never supply
+ * the secret itself, so value / credentials / token are left empty for the
+ * user to fill in on the import form.
+ */
+export interface OpenAPIDeclaredSecurity {
+  /** True when the spec declares a resolvable security requirement. */
+  declared: boolean;
+  /** True when the declared scheme maps onto MCPHub's security model. */
+  supported: boolean;
+  /** Prefill-able security config (structure only, never secrets). */
+  prefill?: OpenAPISecurityConfig;
+  /** Human-readable description of the resolved scheme (e.g. "HTTP bearer (JWT)"). */
+  summary: string;
+  /** Number of OR-alternatives in the resolved requirement (1 = single scheme). */
+  alternatives: number;
+  /** True when a secret the spec cannot supply is required to call tools. */
+  requiresCredentials: boolean;
+  /** Why the declared scheme cannot be represented by MCPHub. */
+  unsupportedReason?: string;
+  /** True when the effective apiKey scheme uses `in: 'cookie'` (cookieSession hint). */
+  cookieHint?: boolean;
+}
+
+/**
+ * Pre-save OpenAPI import preview (#1082): what the generated tool list would
+ * look like if this spec were imported, before anything is persisted.
+ */
+export interface OpenApiToolStats {
+  /** Number of tools extractTools() would generate for the spec. */
+  toolCount: number;
+  /**
+   * Byte length of the JSON array of generated tool definitions — a proxy for
+   * the tools/list payload size clients receive.
+   */
+  definitionsBytes: number;
+  /** cl100k token estimate across all generated tool definitions. */
+  estimatedTokens: number;
+  /** Effective security requirement the spec declares, for form prefill (#1077). */
+  declaredSecurity?: OpenAPIDeclaredSecurity;
 }

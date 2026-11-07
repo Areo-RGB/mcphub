@@ -85,6 +85,22 @@ MCPHub 使用几个配置文件：
 | `maxRestarts`  | number  | `5`             | 最大重启次数       |
 | `restartDelay` | number  | `5000`          | 重启间延迟（毫秒） |
 | `stdio`        | string  | `pipe`          | stdio 配置         |
+| `perSessionClient` | boolean | `false`     | 为每个下游 MCP 会话创建独立的上游客户端，而不是在所有会话间共享同一个连接。适用于 Playwright 等有状态服务器。参见[会话级客户端隔离](#会话级客户端隔离有状态服务器)。 |
+
+### `type: "openapi"`
+
+| 字段 | 类型 | 必需 | 描述 |
+| ---- | ---- | ---- | ---- |
+| `openapi.url` | string | `url`/`schema` 二选一 | MCPHub 将下载的 OpenAPI 文档 URL。 |
+| `openapi.schema` | object | `url`/`schema` 二选一 | 内联的 OpenAPI 文档。 |
+| `headers` | object | 否 | 应用于所有出站请求的静态请求头，包括文档下载本身。 |
+| `openapi.passthroughHeaders` | string[] | 否 | 从调用方转发到上游的请求头名称。 |
+
+每个字段的权威定义见 [src/types/index.ts](src/types/index.ts) 中的 `ServerConfig` 类型；如需此处未描述的行为，请查阅该类型。
+
+<Note>
+受保护的 `openapi.url` 会通过 MCPHub 的已认证客户端下载，因此配置的 `headers` 与 OpenAPI `security` 凭证（HTTP Basic/Bearer、API Key、OAuth2 令牌）会用于该次拉取的认证。凭证仅作用于文档所在源，不会转发给外部 `$ref` 解析或跨源重定向。若受保护的文档引用了同样需要认证的外部 `$ref`，请改用 `openapi.schema` 内联文档。
+</Note>
 
 ## 常见 MCP 服务器示例
 
@@ -119,6 +135,53 @@ MCPHub 使用几个配置文件：
   }
 }
 ```
+
+### 会话级客户端隔离（有状态服务器）
+
+默认情况下，MCPHub 为每个服务器仅保持**一个**上游连接，并在所有下游 MCP 会话间共享。
+对于有状态服务器来说，这意味着所有客户端共享同一份状态——以 Playwright 为例，每个会话都会
+操作同一个浏览器实例及其标签页。
+
+设置 `perSessionClient: true` 可以让 MCPHub 改为**为每个下游会话创建独立的上游客户端**。
+每个会话拥有各自的连接（对于 stdio 服务器，还会拥有各自的子进程），在首次工具调用时惰性创建，
+并在会话结束时自动销毁。
+
+<Note>
+`perSessionClient` 是 **MCPHub 侧**的设置：它控制 MCPHub 打开多少个上游连接。它与 Playwright
+MCP 自身的 `--isolated` 标志不同，后者控制 Playwright 侧的浏览器配置隔离。二者天然互补——同时
+启用即可获得完全隔离的浏览器会话。
+</Note>
+
+```json
+{
+  "mcpServers": {
+    "playwright": {
+      "type": "streamable-http",
+      "url": "http://playwright-mcp:3000/mcp",
+      "perSessionClient": true
+    }
+  }
+}
+```
+
+或者使用本地启动并带有 `--isolated` 标志的 Playwright MCP：
+
+```json
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["@playwright/mcp@latest", "--headless", "--isolated"],
+      "perSessionClient": true
+    }
+  }
+}
+```
+
+<Tip>
+仅对真正持有会话级状态的服务器启用 `perSessionClient`。它会让上游连接（以及 stdio 子进程）
+数量随并发会话数成倍增长，因此对无状态服务器请保持关闭。
+</Tip>
 
 ### 文件和系统服务器
 
@@ -437,6 +500,40 @@ MCPHub 在启动和重新加载时验证配置：
   }
 }
 ```
+
+## 工具结果压缩
+
+MCPHub 可以在工具结果返回 MCP 客户端前，透明压缩较大的文本结果。它适合处理大型日志、diff、搜索输出、JSON 数组或长文本，避免这些内容占用过多模型上下文。
+
+工具结果压缩默认关闭。可以在 **设置 → 工具结果压缩** 中实时开关，也可以在 `systemConfig.toolResultCompression` 下配置：
+
+```json
+{
+  "systemConfig": {
+    "toolResultCompression": {
+      "enabled": false,
+      "minTokens": 2000,
+      "maxOutputTokens": 1200,
+      "strategy": "auto"
+    }
+  }
+}
+```
+
+| 字段 | 类型 | 默认值 | 描述 |
+| ---- | ---- | ------ | ---- |
+| `enabled` | boolean | `false` | 是否对成功的工具结果启用透明压缩。 |
+| `minTokens` | number | `2000` | 单个文本块的估算 token 数达到或超过该阈值时才会压缩。 |
+| `maxOutputTokens` | number | `1200` | 每个压缩后文本块的目标 token 预算。 |
+| `strategy` | `"auto" \| "json" \| "log" \| "search" \| "diff" \| "text"` | `"auto"` | 压缩策略。`auto` 会自动识别常见结构化输出。 |
+
+压缩只作用于成功的工具响应。带有 `isError: true` 的响应会原样返回，非文本内容块会被保留，每个文本块会独立判断是否需要压缩。MCPHub 压缩结果时会在文本开头加入类似下面的标记：
+
+```text
+[mcphub:compressed-tool-result strategy=log original_tokens=9000 compressed_tokens=1200 omitted_lines=240]
+```
+
+活动日志仍记录上游工具的原始输出，压缩只发生在返回 MCP 客户端之前，因此运维人员仍可在 MCPHub 中查看完整结果。
 
 ## 最佳实践
 

@@ -4,7 +4,7 @@
  */
 
 const REDACTED_VALUE = '[REDACTED]';
-const REMOTE_ERROR_REDACTED_MESSAGE = '[Remote request failed; response details omitted]';
+const REMOTE_MESSAGE_LIMIT = 2048;
 
 const SENSITIVE_LOG_KEY_NAMES = new Set([
   'authorization',
@@ -22,9 +22,36 @@ const SENSITIVE_LOG_KEY_NAMES = new Set([
   'xapikey',
   'initialaccesstoken',
   'registrationaccesstoken',
+  'codeverifier',
   'privatekey',
   'assertion',
+  'errordescription',
+  'erroruri',
+  'errorcode',
 ]);
+
+const SENSITIVE_INLINE_KEY_PATTERN =
+  'access_token|refresh_token|id_token|client_secret|api_key|token|password|authorization|secret|error_description|error_uri|error_code|code_verifier|codeverifier';
+
+const AUTHORIZATION_CREDENTIAL_RE =
+  /((?:authorization|proxy-authorization)\s*[:=]\s*(?:bearer|basic)\s+)[^\s",;]+/gi;
+const BEARER_BASIC_CREDENTIAL_RE = /\b(Bearer|Basic)\s+[A-Za-z0-9\-._~+/]+=*/gi;
+const SENSITIVE_QUERY_PARAM_RE = new RegExp(
+  `([?&](?:${SENSITIVE_INLINE_KEY_PATTERN})=)[^&#\\s",;]+`,
+  'gi',
+);
+const SENSITIVE_EQUALS_RE = new RegExp(
+  `(\\b(?:${SENSITIVE_INLINE_KEY_PATTERN})\\s*[:=]\\s*)[^\\s",;]+`,
+  'gi',
+);
+const SENSITIVE_JSON_DOUBLE_QUOTE_RE = new RegExp(
+  `("(?:${SENSITIVE_INLINE_KEY_PATTERN})"\\s*:\\s*")([^"]*)(")`,
+  'gi',
+);
+const SENSITIVE_JSON_SINGLE_QUOTE_RE = new RegExp(
+  `('(?:${SENSITIVE_INLINE_KEY_PATTERN})'\\s*:\\s*')([^']*)(')`,
+  'gi',
+);
 
 const normalizeKey = (key: string): string => key.replace(/[^a-z0-9]/gi, '').toLowerCase();
 
@@ -47,23 +74,31 @@ const isSensitiveLogKey = (key: string): boolean => {
 export const sanitizeStringForLogging = (value: string): string => {
   let sanitized = value;
 
+  sanitized = sanitized.replace(/\b(?:set-cookie|cookie)\s*:\s*[^\r\n]+/gi, 'Cookie: [REDACTED]');
   sanitized = sanitized.replace(
-    /((?:authorization|proxy-authorization)\s*[:=]\s*(?:bearer|basic)\s+)[^\s",;]+/gi,
-    `$1${REDACTED_VALUE}`,
-  );
-  sanitized = sanitized.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9\-._~+/]+=*/gi, `$1 ${REDACTED_VALUE}`);
-  sanitized = sanitized.replace(
-    /([?&](?:access_token|refresh_token|id_token|client_secret|api_key|token|password|authorization)=)[^&#\s"]+/gi,
-    `$1${REDACTED_VALUE}`,
+    /\b(?:sk-[A-Za-z0-9_-]+|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+)\b/g,
+    REDACTED_VALUE,
   );
   sanitized = sanitized.replace(
-    /("(?:access_token|refresh_token|id_token|client_secret|api_key|authorization|token|password|secret)"\s*:\s*")([^"]*)(")/gi,
-    `$1${REDACTED_VALUE}$3`,
+    /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g,
+    REDACTED_VALUE,
   );
-  sanitized = sanitized.replace(
-    /('(?:access_token|refresh_token|id_token|client_secret|api_key|authorization|token|password|secret)'\s*:\s*')([^']*)(')/gi,
-    `$1${REDACTED_VALUE}$3`,
-  );
+
+  sanitized = sanitized.replace(AUTHORIZATION_CREDENTIAL_RE, `$1${REDACTED_VALUE}`);
+  sanitized = sanitized.replace(BEARER_BASIC_CREDENTIAL_RE, `$1 ${REDACTED_VALUE}`);
+  sanitized = sanitized.replace(SENSITIVE_QUERY_PARAM_RE, `$1${REDACTED_VALUE}`);
+  sanitized = sanitized.replace(SENSITIVE_EQUALS_RE, `$1${REDACTED_VALUE}`);
+  sanitized = sanitized.replace(SENSITIVE_JSON_DOUBLE_QUOTE_RE, `$1${REDACTED_VALUE}$3`);
+  sanitized = sanitized.replace(SENSITIVE_JSON_SINGLE_QUOTE_RE, `$1${REDACTED_VALUE}$3`);
+
+  // URLs may embed credentials in userinfo, paths, or arbitrary query keys.
+  sanitized = sanitized.replace(/https?:\/\/[^\s<>"']+/gi, (url) => {
+    try {
+      return new URL(url).origin;
+    } catch {
+      return '[REDACTED_URL]';
+    }
+  });
 
   return sanitized;
 };
@@ -102,10 +137,9 @@ const serializeRemoteError = (error: Error): Record<string, unknown> => {
 
   return {
     name: error.name,
-    message: REMOTE_ERROR_REDACTED_MESSAGE,
+    message: sanitizeStringForLogging(error.message).slice(0, REMOTE_MESSAGE_LIMIT),
     code: candidate.code,
-    status:
-      typeof candidate.status === 'number' ? candidate.status : candidate.response?.status,
+    status: typeof candidate.status === 'number' ? candidate.status : candidate.response?.status,
     requestId: typeof requestId === 'string' ? requestId : undefined,
     hasResponseBody: candidate.response?.data !== undefined,
   };
@@ -127,9 +161,34 @@ const serializeError = (error: Error): Record<string, unknown> => {
   return serialized;
 };
 
+const summarizeSerializedErrorForLogging = (
+  serialized: Record<string, unknown>,
+): Record<string, unknown> => {
+  const summary: Record<string, unknown> = {};
+
+  ['name', 'message', 'stack', 'requestId', 'upstreamStderr'].forEach((key) => {
+    if (typeof serialized[key] === 'string') {
+      summary[key] = sanitizeStringForLogging(serialized[key]);
+    }
+  });
+  if (typeof serialized.code === 'string') {
+    summary.code = sanitizeStringForLogging(serialized.code);
+  } else if (typeof serialized.code === 'number') {
+    summary.code = serialized.code;
+  }
+  if (typeof serialized.status === 'number') {
+    summary.status = serialized.status;
+  }
+  if (typeof serialized.hasResponseBody === 'boolean') {
+    summary.hasResponseBody = serialized.hasResponseBody;
+  }
+
+  return summary;
+};
+
 export const summarizeErrorForLogging = (error: unknown): Record<string, unknown> => {
   if (error instanceof Error) {
-    return serializeError(error);
+    return summarizeSerializedErrorForLogging(serializeError(error));
   }
 
   if (typeof error === 'string') {
@@ -148,12 +207,17 @@ export const summarizeErrorForLogging = (error: unknown): Record<string, unknown
     }
     if (typeof record.code === 'string') {
       summary.code = sanitizeStringForLogging(record.code);
+    } else if (typeof record.code === 'number') {
+      summary.code = record.code;
     }
     if (typeof record.status === 'number') {
       summary.status = record.status;
     }
     if (typeof record.requestId === 'string') {
       summary.requestId = sanitizeStringForLogging(record.requestId);
+    }
+    if (typeof record.upstreamStderr === 'string') {
+      summary.upstreamStderr = sanitizeStringForLogging(record.upstreamStderr);
     }
 
     if (Object.keys(summary).length > 0) {
@@ -195,29 +259,86 @@ export const formatErrorForLogging = (error: unknown): string => {
   if (summary.status !== undefined) {
     parts.push(`status=${summary.status}`);
   }
-  if (typeof summary.code === 'string') {
+  if (typeof summary.code === 'string' || typeof summary.code === 'number') {
     parts.push(`code=${summary.code}`);
   }
   if (typeof summary.requestId === 'string') {
     parts.push(`requestId=${summary.requestId}`);
   }
+  if (typeof summary.upstreamStderr === 'string') {
+    parts.push(`Upstream stderr:\n${summary.upstreamStderr}`);
+  }
 
   return parts.join(' | ') || 'Unknown error';
 };
 
-const createSafeJsonReplacer = () => {
-  const seen = new WeakSet<object>();
+const CIRCULAR_REFERENCE = '[Circular Reference]';
 
-  return (_key: string, value: unknown): unknown => {
-    if (typeof value === 'object' && value !== null) {
-      if (seen.has(value)) {
-        return '[Circular Reference]';
+/**
+ * Tracks the chain of ancestors during a single JSON.stringify traversal so
+ * that only true circular references (an object that contains itself, directly
+ * or transitively) are flagged — not diamond/shared references where the same
+ * object is reachable from two sibling keys.
+ *
+ * A naive `WeakSet` of every visited object cannot tell the two apart: it marks
+ * a shared-but-acyclic object as circular the second time it is seen, silently
+ * dropping data. JSON.stringify traverses depth-first and invokes the replacer
+ * with `this` bound to the object that holds the current value, so we keep an
+ * ancestor stack and unwind it back to the current holder before each check.
+ */
+const createAncestorTracker = () => {
+  const stack: unknown[] = [];
+
+  return {
+    isCircular(holder: unknown, value: unknown): boolean {
+      // Unwind to the current holder: siblings share a holder, so anything still
+      // on the stack below it belongs to an already-finished branch.
+      while (stack.length > 0 && stack[stack.length - 1] !== holder) {
+        stack.pop();
       }
 
-      seen.add(value);
+      if (stack.includes(value)) {
+        return true;
+      }
+
+      stack.push(value);
+      return false;
+    },
+    // When a value is replaced mid-traversal (an Error becomes a plain object),
+    // swap it on the stack too. JSON.stringify walks the *replacement's*
+    // properties next, passing it as the holder, so the stack must reference the
+    // replacement or the unwind above would empty the stack and miss cycles that
+    // close through the error.
+    replace(oldValue: unknown, newValue: unknown): void {
+      const index = stack.indexOf(oldValue);
+      if (index !== -1) {
+        stack[index] = newValue;
+      }
+    },
+  };
+};
+
+const createSafeJsonReplacer = () => {
+  const tracker = createAncestorTracker();
+  // serializeError() returns a fresh object on each call, so a cyclic
+  // Error.cause chain would keep producing new objects forever; this guard
+  // breaks it independently of the ancestor stack.
+  const seenErrors = new WeakSet<Error>();
+
+  return function (this: unknown, _key: string, value: unknown): unknown {
+    if (typeof value === 'object' && value !== null) {
+      if (tracker.isCircular(this, value)) {
+        return CIRCULAR_REFERENCE;
+      }
 
       if (value instanceof Error) {
-        return serializeError(value);
+        if (seenErrors.has(value)) {
+          return CIRCULAR_REFERENCE;
+        }
+        seenErrors.add(value);
+        const serialized = serializeError(value);
+        tracker.replace(value, serialized);
+        return serialized;
       }
     }
 
@@ -226,9 +347,10 @@ const createSafeJsonReplacer = () => {
 };
 
 const createSafeLogReplacer = () => {
-  const seen = new WeakSet<object>();
+  const tracker = createAncestorTracker();
+  const seenErrors = new WeakSet<Error>();
 
-  return (key: string, value: unknown): unknown => {
+  return function (this: unknown, key: string, value: unknown): unknown {
     if (isSensitiveLogKey(key)) {
       return REDACTED_VALUE;
     }
@@ -238,14 +360,18 @@ const createSafeLogReplacer = () => {
     }
 
     if (typeof value === 'object' && value !== null) {
-      if (seen.has(value)) {
-        return '[Circular Reference]';
+      if (tracker.isCircular(this, value)) {
+        return CIRCULAR_REFERENCE;
       }
 
-      seen.add(value);
-
       if (value instanceof Error) {
-        return serializeError(value);
+        if (seenErrors.has(value)) {
+          return CIRCULAR_REFERENCE;
+        }
+        seenErrors.add(value);
+        const serialized = serializeError(value);
+        tracker.replace(value, serialized);
+        return serialized;
       }
     }
 
@@ -274,6 +400,24 @@ export const createSafeJSON = <T>(obj: T): T => {
  */
 export const safeStringify = (obj: any, space?: number): string => {
   return JSON.stringify(obj, createSafeLogReplacer(), space);
+};
+
+/**
+ * JSON stringifier that is safe against circular references and serializes
+ * Error instances, but does NOT redact field values.
+ *
+ * Use this for persisting tool call input/output verbatim: heuristic
+ * (key-name / regex) redaction produces both false positives that corrupt the
+ * audit record and false negatives that give a misleading sense of safety, so
+ * whether such payloads are stored at all is a deployment decision (config
+ * switch) rather than something to guess at per field.
+ *
+ * @param obj - The object to stringify
+ * @param space - Number of spaces to use for indentation (optional)
+ * @returns JSON string representation of the object
+ */
+export const stringifyWithoutRedaction = (obj: any, space?: number): string => {
+  return JSON.stringify(obj, createSafeJsonReplacer(), space);
 };
 
 /**

@@ -1,32 +1,77 @@
-# MCPHub：一站式 MCP 服务器聚合平台
+# MCPHub
+
+> 开源、自托管的 MCP 网关与控制平面，用于连接、控制和运行 MCP 服务器。
+
+[![CI](https://github.com/samanhappy/mcphub/actions/workflows/ci.yml/badge.svg)](https://github.com/samanhappy/mcphub/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/@samanhappy/mcphub)](https://www.npmjs.com/package/@samanhappy/mcphub)
+[![Docker pulls](https://img.shields.io/docker/pulls/samanhappy/mcphub)](https://hub.docker.com/r/samanhappy/mcphub)
+[![License](https://img.shields.io/github/license/samanhappy/mcphub)](LICENSE)
+[![Discord](https://img.shields.io/badge/discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/2BJehJZVH5)
+[![GitHub stars](https://img.shields.io/github/stars/samanhappy/mcphub?style=social)](https://github.com/samanhappy/mcphub/stargazers)
 
 [English](README.md) | [Français](README.fr.md) | 中文版
 
-MCPHub 通过将多个 MCP（Model Context Protocol）服务器组织为灵活的流式 HTTP（SSE）端点，简化了管理与扩展工作。系统支持按需访问全部服务器、单个服务器或按场景分组的服务器集合。
+MCPHub 是 AI 客户端与 MCP 服务器之间的统一控制点。一次连接本地和远程 MCP 服务器，通过稳定端点组织和路由其能力，借助身份认证、限定作用域的凭据和用户级可见性控制访问，并通过集中日志、活动追踪和健康监控统一运行与管理。
+
+兼容 Claude Code、Cursor、Cherry Studio、OpenWebUI 及其他支持 MCP 的应用。
 
 ![控制面板预览](assets/dashboard.zh.png)
 
-## 🌐 在线文档与演示
+## 🌐 官网、演示与文档
 
-- **文档地址**: [docs.mcphub.app](https://docs.mcphub.app/)
+- **官网**: [mcphub.app](https://www.mcphub.app/zh)
+- **文档**: [docs.mcphub.app](https://docs.mcphub.app/)
 - **演示环境**: [demo.mcphub.app](https://demo.mcphub.app/)
 
 ## 🚀 功能亮点
 
-- **集中式管理** - 在统一控制台中监控和管理所有 MCP 服务器
-- **灵活路由** - 通过 HTTP/SSE 访问所有服务器、特定分组或单个服务器
-- **智能路由** - 基于向量语义搜索的 AI 工具发现 ([了解更多](https://docs.mcphub.app/zh/features/smart-routing))
+### 一次连接，随处暴露
+
+- **智能路由** ⭐ - 基于向量语义搜索的 AI 工具发现 ([了解更多](https://docs.mcphub.app/zh/features/smart-routing))
+- **统一 MCP 网关** - 通过稳定的 MCP 端点暴露所有已连接的服务器，也支持分组和单服务器路由
+- **服务器别名与路由** - 设置别名，并将客户端路由到所有服务器、指定分组、单个服务器或智能路由
+- **SSE / Streamable HTTP / stdio 支持** - 通过支持的传输方式连接本地和远程 MCP 服务器
 - **热插拔配置** - 无需停机即可添加、移除或更新服务器
-- **OAuth 2.0 支持** - 客户端和服务端模式，实现安全认证 ([了解更多](https://docs.mcphub.app/zh/features/oauth))
+
+### 管控访问与凭据
+
+- **个人凭据** ⭐ - 一个共享服务器支持每位用户独立绑定密钥，加密保存并隔离 stdio 运行进程（[了解更多](docs/zh/features/per-user-credentials.mdx)）
+- **身份认证与访问控制** - 使用 OAuth 2.0、Bearer Key 以及服务器或分组可见性控制访问权限
+- **OAuth 2.0 支持** ⭐ - 客户端和服务端模式，实现安全认证 ([了解更多](https://docs.mcphub.app/zh/features/oauth))
 - **社交一键登录** - 通过 Better Auth 集成支持 GitHub 和 Google 快捷登录（需启用数据库模式）
+- **服务器与分组管理** - 组织服务器分组，管理可见性，并控制 Tool、Prompt 与 Resource 的暴露范围
+
+### 稳定运行
+
+- **日志与可观测性** - 查看工具调用活动、请求状态、延迟和服务器日志
+- **健康检查** - 在一个地方监控连接健康状况和服务器状态
+- **Web 控制台** - 通过浏览器管理服务器配置和运行状态
+- **工具结果压缩** - 在返回客户端前透明压缩大型文本工具输出
 - **数据库模式** - 将配置存储在 PostgreSQL 中，适用于生产环境 ([了解更多](https://docs.mcphub.app/zh/configuration/database-configuration))
 - **Docker 就绪** - 容器化部署，开箱即用
 
 ## 🔧 快速开始
 
+### 前置条件
+
+- **Docker**（推荐）—— 运行 MCPHub 最快的方式，下面的命令都基于它
+- **Node.js** `^18.0.0 || >=20.0.0` 和 **pnpm** `10.12.4` —— 仅从源码运行或参与本地开发时需要（见[本地开发](#本地开发)）
+
+### 使用 Docker 启动
+
+```bash
+docker run -p 3000:3000 -v ./data:/app/data samanhappy/mcphub
+```
+
+打开 `http://localhost:3000`，使用用户名 `admin` 登录。首次启动时，如果未设置 `ADMIN_PASSWORD` 环境变量，系统将自动生成随机密码并输出到服务器日志中。
+
+配置、用户和凭据绑定默认持久化到 `./data`。
+
+想用自己的服务器？首次启动前，创建 `data/mcp_settings.json`（见[配置](#配置)）。启动后，可在控制台添加服务器，或编辑现有配置文件并重启 MCPHub。
+
 ### 配置
 
-创建 `mcp_settings.json` 文件：
+首次启动前，创建 `data/mcp_settings.json` 文件：
 
 ```json
 {
@@ -47,24 +92,27 @@ MCPHub 通过将多个 MCP（Model Context Protocol）服务器组织为灵活�
 
 ### Docker 部署
 
-```bash
-# 挂载自定义配置运行（推荐）
-docker run -p 3000:3000 -v ./mcp_settings.json:/app/mcp_settings.json -v ./data:/app/data samanhappy/mcphub
+可复制的命令见[使用 Docker 启动](#使用-docker-启动)。请保持挂载 `./data`，这样配置、用户和凭据绑定在容器重建后不会丢失。
 
-# 或使用默认配置运行
-docker run -p 3000:3000 samanhappy/mcphub
-```
+`samanhappy/mcphub` 提供两种镜像变体：
+
+- **`latest`**（默认镜像）— 包含 Node.js/pnpm、Python、uv/uvx、Git、构建工具，覆盖大多数 MCP server 场景。
+- **`latest-full`**（扩展镜像）— 在 `latest` 基础上增加 Rust 工具链（Cargo/rustc）、Docker Engine，以及 Playwright 浏览器（Chrome + Firefox，仅限 amd64）。适合需要运行 Rust MCP server 或容器嵌套的场景。镜像体积更大。
+
+构建选项与 Docker-in-Docker 配置详见 [Docker 部署文档](https://docs.mcphub.app/zh/configuration/docker-setup)。
 
 ### 访问控制台
 
-打开 `http://localhost:3000`，使用用户名 `admin` 登录。首次启动时，如果未设置 `ADMIN_PASSWORD` 环境变量，系统将自动生成随机密码并输出到服务器日志中。也可以预先设置密码：
+打开 `http://localhost:3000`（登录方式见[使用 Docker 启动](#使用-docker-启动)）。也可以预先设置密码：
 
 ```bash
 # Docker：通过环境变量设置管理员密码
-docker run -p 3000:3000 -e ADMIN_PASSWORD=your-secure-password samanhappy/mcphub
+docker run -p 3000:3000 -v ./data:/app/data -e ADMIN_PASSWORD=your-secure-password samanhappy/mcphub
 ```
 
 > **提示：** 首次登录后请及时修改管理员密码以确保安全。
+
+> **无界面模式：** 设置 `DISABLE_WEB=true` 后，MCPHub 将不再提供内置控制台 UI，只保留后端/API 与 MCP 端点。适合直接通过 `mcp_settings.json` 管理服务的场景。
 
 ### 连接 AI 客户端
 
@@ -91,6 +139,7 @@ http://localhost:3000/mcp/$smart/{group}  # 智能路由（特定分组）
 | [数据库模式](https://docs.mcphub.app/zh/configuration/database-configuration) | PostgreSQL 生产环境配置      |
 | [OAuth](https://docs.mcphub.app/zh/features/oauth)                            | OAuth 2.0 客户端和服务端配置 |
 | [智能路由](https://docs.mcphub.app/zh/features/smart-routing)                 | AI 驱动的工具发现            |
+| [CLI 指南](https://docs.mcphub.app/zh/features/cli)                           | 终端管理与工具调用           |
 | [Docker 部署](https://docs.mcphub.app/zh/configuration/docker-setup)          | Docker 部署指南              |
 
 ## 🧑‍💻 本地开发
@@ -102,16 +151,28 @@ pnpm install
 pnpm dev
 ```
 
+本地开发默认使用 `admin` / `admin123`，并将可写配置副本保存到 `data/mcp_settings.dev.json`，仓库里的 `mcp_settings.json` 不包含默认凭证。
+
 > Windows 用户需分别启动后端和前端：`pnpm backend:dev`，`pnpm frontend:dev`
 
 📖 查看[开发指南](https://docs.mcphub.app/zh/development)了解详细设置说明。
 
 ## 🔍 技术栈
 
-- **后端**：Node.js、Express、TypeScript
+- **后端**：Node.js、Express、TypeScript（ESM）
 - **前端**：React、Vite、Tailwind CSS
-- **认证**：JWT & bcrypt
+- **存储**：默认基于文件的 `mcp_settings.json`；可选 PostgreSQL（TypeORM + pgvector，用于智能路由）
+- **认证**：本地账号使用 JWT + bcrypt；支持 Bearer Key、内置 OAuth 2.0 服务端（`@node-oauth/oauth2-server`），以及可选的 Better Auth（GitHub/Google 一键登录）
 - **协议**：Model Context Protocol SDK
+
+## 🏢 生产支持
+
+正在生产环境使用 MCPHub？
+
+可以直接与维护者合作，解决生产架构、OAuth/OIDC、身份与访问控制、
+凭据管理、审计、Kubernetes 和高可用准备等问题。
+
+[讨论 Production Pilot →](https://www.mcphub.app/zh/pricing)
 
 ## 👥 贡献指南
 
@@ -123,13 +184,15 @@ pnpm dev
 
 <img src="assets/reward.png" width="350">
 
+海外用户可通过 [ko-fi](https://ko-fi.com/samanhappy) 支持。
+
 ## 致谢
 
 感谢以下朋友的赞赏：小白、唐秀川、琛、孔、黄祥取、兰军飞、无名之辈、Kyle，以及其他匿名支持者。
 
 ## 🌟 Star 历史趋势
 
-[![Star History Chart](https://api.star-history.com/svg?repos=samanhappy/mcphub&type=Date)](https://www.star-history.com/#samanhappy/mcphub&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=samanhappy/mcphub&type=Date)](https://star-history.dera.page/#samanhappy/mcphub&Date)
 
 ## 📄 许可证
 

@@ -19,7 +19,8 @@ import * as mockSettings from '../utils/mockSettings.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { cleanupAllServers } from '../../src/services/mcpService.js';
+import { cleanupAllServers, deleteMcpServer } from '../../src/services/mcpService.js';
+import { transports } from '../../src/services/sseService.js';
 
 describe('Real Client Transport Integration Tests', () => {
   let _appServer: AppServer;
@@ -28,7 +29,17 @@ describe('Real Client Transport Integration Tests', () => {
   let testServerHelper: TestServerHelper;
 
   beforeAll(async () => {
-    const settings = mockSettings.createMockSettings();
+    const settings = mockSettings.createMockSettings({
+      systemConfig: {
+        routing: {
+          enableGlobalRoute: true,
+          enableGroupNameRoute: true,
+          enableBearerAuth: true,
+          bearerAuthKey: 'test-auth-token-123',
+        },
+        enableSessionRebuild: true,
+      },
+    });
     testServerHelper = new TestServerHelper();
     const result = await testServerHelper.createTestServer(settings);
 
@@ -170,6 +181,64 @@ describe('Real Client Transport Integration Tests', () => {
       expect(error).toBeNull();
       expect(isConnected).toBe(true);
     }, 60000);
+
+    it('should connect using real SSEClientTransport with single server', async () => {
+      const testServer = 'test-server-1';
+      const options = {
+        requestInit: {
+          headers: {
+            Authorization: 'Bearer test-auth-token-123',
+          },
+        },
+      };
+      const sseUrl = new URL(`${baseURL}/sse/${testServer}`);
+
+      const transport = new SSEClientTransport(sseUrl, options);
+
+      const client = new Client(
+        {
+          name: 'real-sse-server-test-client',
+          version: '1.0.0',
+        },
+        {
+          capabilities: {
+            tools: {},
+            resources: {},
+            prompts: {},
+          },
+        },
+      );
+
+      let isConnected = false;
+      let error: any = null;
+
+      try {
+        await client.connect(transport, {});
+        isConnected = true;
+
+        console.log(`SSE Client with server ${testServer} connected successfully`);
+
+        // Test basic operations
+        const tools = await client.listTools({});
+        console.log('Available tools (SSE with server):', JSON.stringify(tools, null, 2));
+
+        await client.close();
+      } catch (err) {
+        error = err;
+        console.error('SSE Client with server test failed:', err);
+
+        if (isConnected) {
+          try {
+            await client.close();
+          } catch (closeErr) {
+            console.error('Error closing client:', closeErr);
+          }
+        }
+      }
+
+      expect(error).toBeNull();
+      expect(isConnected).toBe(true);
+    }, 60000);
   });
 
   describe('StreamableHTTP Client Transport Tests', () => {
@@ -287,6 +356,222 @@ describe('Real Client Transport Integration Tests', () => {
       expect(error).toBeNull();
       expect(isConnected).toBe(true);
     }, 60000);
+
+    it('continues an existing HTTP session through equivalent group routes', async () => {
+      const testGroup = 'integration-test-group';
+      const transport = new StreamableHTTPClientTransport(new URL(`${baseURL}/mcp/${testGroup}`), {
+        requestInit: {
+          headers: {
+            Authorization: 'Bearer test-auth-token-123',
+          },
+        },
+      });
+      const client = new Client(
+        {
+          name: 'real-http-equivalent-route-test-client',
+          version: '1.0.0',
+        },
+        {
+          capabilities: {
+            tools: {},
+            resources: {},
+            prompts: {},
+          },
+        },
+      );
+
+      try {
+        await client.connect(transport, {});
+        await client.listTools({});
+
+        const sessionId = transport.sessionId;
+        expect(sessionId).toBeDefined();
+
+        for (const route of ['/mcp', `/mcp/$smart/${testGroup}`]) {
+          const response = await fetch(baseURL + route, {
+            method: 'POST',
+            headers: {
+              Accept: 'application/json, text/event-stream',
+              Authorization: 'Bearer test-auth-token-123',
+              'Content-Type': 'application/json',
+              'mcp-session-id': sessionId as string,
+            },
+            body: JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              method: 'tools/list',
+              params: {},
+            }),
+          });
+
+          expect(response.ok).toBe(true);
+          await response.arrayBuffer();
+        }
+      } finally {
+        await client.close();
+      }
+    }, 60000);
+
+    it('should connect using real StreamableHTTPClientTransport with single server', async () => {
+      const testServer = 'test-server-1';
+      const mcpUrl = new URL(`${baseURL}/mcp/${testServer}`);
+      const options: any = {
+        requestInit: {
+          headers: {
+            Authorization: `Bearer test-auth-token-123`,
+          },
+        },
+      };
+
+      const transport = new StreamableHTTPClientTransport(mcpUrl, options);
+
+      const client = new Client(
+        {
+          name: 'real-http-server-test-client',
+          version: '1.0.0',
+        },
+        {
+          capabilities: {
+            tools: {},
+            resources: {},
+            prompts: {},
+          },
+        },
+      );
+
+      let isConnected = false;
+      let error: any = null;
+
+      try {
+        await client.connect(transport, {});
+        isConnected = true;
+
+        console.log(`HTTP Client with server ${testServer} connected successfully`);
+
+        // Test basic operations
+        const tools = await client.listTools({});
+        console.log('Available tools (HTTP with server):', JSON.stringify(tools, null, 2));
+
+        await client.close();
+      } catch (err) {
+        error = err;
+        console.error('HTTP Client with server test failed:', err);
+
+        if (isConnected) {
+          try {
+            await client.close();
+          } catch (closeErr) {
+            console.error('Error closing client:', closeErr);
+          }
+        }
+      }
+
+      expect(error).toBeNull();
+      expect(isConnected).toBe(true);
+    }, 60000);
+
+    it.each([false, true])(
+      'serves cached tool names after session rebuild (Apps: %s)',
+      async (appsCapable) => {
+        const testGroup = 'integration-test-group';
+        const mcpUrl = new URL(`${baseURL}/mcp/${testGroup}`);
+        const options: any = {
+          requestInit: {
+            headers: {
+              Authorization: 'Bearer test-auth-token-123',
+            },
+          },
+        };
+
+        const transport = new StreamableHTTPClientTransport(mcpUrl, options);
+        const client = new Client(
+          {
+            name: 'real-http-rebuild-test-client',
+            version: '1.0.0',
+          },
+          {
+            capabilities: {
+              ...(appsCapable
+                ? {
+                    extensions: {
+                      'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] },
+                    },
+                  }
+                : {}),
+              tools: {},
+              resources: {},
+              prompts: {},
+            },
+          },
+        );
+
+        const createTimeout = (ms: number) =>
+          new Promise<never>((_, reject) => {
+            setTimeout(() => {
+              reject(new Error(`Timed out after ${ms}ms waiting for rebuilt session response`));
+            }, ms);
+          });
+
+        const waitForTools = async () => {
+          const maxAttempts = 30;
+
+          for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            const listedTools = await client.listTools({});
+
+            if (listedTools.tools.length > 0) {
+              return listedTools;
+            }
+
+            await new Promise((resolve) => setTimeout(resolve, 500));
+          }
+
+          throw new Error('Timed out waiting for upstream tools to become available');
+        };
+
+        let sessionId: string | undefined;
+
+        try {
+          await client.connect(transport, {});
+
+          const tools = await waitForTools();
+          sessionId = transport.sessionId;
+
+          expect(sessionId).toBeDefined();
+          expect(tools.tools.length).toBeGreaterThan(0);
+
+          const toolName = tools.tools[0]?.name;
+
+          expect(toolName).toBeDefined();
+
+          delete transports[sessionId as string];
+          deleteMcpServer(sessionId as string);
+
+          const result = await Promise.race([
+            client.callTool({ name: toolName as string, arguments: {} }),
+            createTimeout(5000),
+          ]);
+
+          expect(result.isError).not.toBe(true);
+          expect(result).toEqual(
+            expect.objectContaining({
+              content: expect.arrayContaining([
+                expect.objectContaining({
+                  type: 'text',
+                }),
+              ]),
+            }),
+          );
+        } finally {
+          if (sessionId) {
+            delete transports[sessionId];
+            deleteMcpServer(sessionId);
+          }
+
+          await client.close();
+        }
+      },
+      60000,
+    );
   });
 
   describe('Real Client Authentication Tests', () => {
@@ -309,6 +594,28 @@ describe('Real Client Transport Integration Tests', () => {
         _authHttpServer.close();
       }
     });
+
+    it.each(['POST', 'GET', 'DELETE'])(
+      'returns 404 for expired sessions with rebuild disabled (%s)',
+      async (method) => {
+        const response = await fetch(authBaseURL + '/mcp', {
+          method,
+          headers: {
+            Authorization: 'Bearer test-auth-token-123',
+            Accept: 'application/json, text/event-stream',
+            'Content-Type': 'application/json',
+            'mcp-session-id': 'expired-session-1144',
+          },
+          ...(method === 'POST'
+            ? {
+                body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+              }
+            : {}),
+        });
+        expect(response.status).toBe(404);
+        expect(await response.text()).toContain('Please reinitialize the session');
+      },
+    );
 
     it('should fail to connect with SSEClientTransport without auth', async () => {
       const sseUrl = new URL(`${authBaseURL}/sse`);

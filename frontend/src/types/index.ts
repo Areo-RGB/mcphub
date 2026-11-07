@@ -55,6 +55,37 @@ export interface MarketServer {
   is_official?: boolean;
 }
 
+export type ChangelogCategory = 'feature' | 'fix' | 'breaking' | 'security';
+
+export interface ChangelogEntry {
+  product: 'mcphub';
+  version: string;
+  tagName: string;
+  publishedAt: string;
+  url: string;
+  changelogUrl: string;
+  title: string;
+  summary: string;
+  highlights: string[];
+  fixes: string[];
+  breakingChanges: string[];
+  upgradeNotes: string[];
+  categories: ChangelogCategory[];
+  locale: 'en' | 'zh';
+  bodyMarkdown: string;
+  isStructured: boolean;
+}
+
+export interface ChangelogUpdateInfo {
+  latestVersion: string | null;
+  hasUpdate: boolean;
+  entries: ChangelogEntry[];
+  totalUpdateCount: number;
+  changelogUrl: string;
+  allChangelogUrl: string;
+  source: 'mcphub-web' | 'npm-fallback' | 'disabled';
+}
+
 // Cloud Server types (for MCPRouter API)
 export interface CloudServer {
   created_at: string;
@@ -87,7 +118,11 @@ export interface ToolInputSchema {
 export interface Tool {
   name: string;
   description: string;
+  defaultDescription?: string;
+  hasDescriptionOverride?: boolean;
   inputSchema: ToolInputSchema;
+  annotations?: Record<string, unknown>;
+  _meta?: Record<string, unknown>;
   enabled?: boolean;
 }
 
@@ -111,6 +146,8 @@ export interface Resource {
   name?: string;
   description?: string;
   mimeType?: string;
+  annotations?: Record<string, unknown>;
+  _meta?: Record<string, unknown>;
   enabled?: boolean;
 }
 
@@ -155,8 +192,23 @@ export interface ProxychainsConfig {
   configPath?: string; // Path to custom proxychains4 configuration file (optional)
 }
 
+export interface CredentialSlot {
+  target: 'env' | 'headers';
+  name: string;
+  label?: string;
+}
+
+export interface MyCredentialBinding {
+  serverName: string;
+  credentialTemplate: CredentialSlot[];
+  configured: boolean;
+  configuredSlots: string[];
+  updatedAt: string | null;
+}
+
 // Server config types
 export interface ServerConfig {
+  credentialTemplate?: CredentialSlot[];
   type?: 'stdio' | 'sse' | 'streamable-http' | 'openapi';
   description?: string;
   url?: string;
@@ -166,10 +218,19 @@ export interface ServerConfig {
   headers?: Record<string, string>;
   passthroughHeaders?: string[];
   enabled?: boolean;
-  enableKeepAlive?: boolean; // Enable keep-alive for this server (requires global enable as well)
-  keepAliveInterval?: number; // Keep-alive ping interval in milliseconds (default: 60000ms)
+  // Per-server visibility for non-admin users.
+  visibility?: 'private' | 'group' | 'public';
+  sharedWithUsers?: string[];
+  enableKeepAlive?: boolean; // Enable remote health checks and automatic reconnect attempts
+  keepAliveInterval?: number; // Health check and reconnect interval in milliseconds (default: 60000ms)
+  perSessionClient?: boolean; // Create a dedicated upstream client per downstream session instead of sharing one connection (for stateful servers like Playwright)
+  // On-demand spawning: start the stdio process only when a tool call arrives,
+  // and shut it down automatically after a period of inactivity (stdio only).
+  startOnDemand?: boolean;
+  idleTimeoutMs?: number; // Milliseconds of inactivity before shutting down (default: 300_000)
   tools?: Record<string, { enabled: boolean; description?: string }>; // Tool-specific configurations with enable/disable state and custom descriptions
   prompts?: Record<string, { enabled: boolean; description?: string }>; // Prompt-specific configurations with enable/disable state and custom descriptions
+  resources?: Record<string, { enabled: boolean; description?: string }>; // Resource-specific configurations with enable/disable state and custom descriptions
   options?: {
     timeout?: number; // Request timeout in milliseconds
     resetTimeoutOnProgress?: boolean; // Reset timeout on progress notifications
@@ -181,6 +242,7 @@ export interface ServerConfig {
   oauth?: {
     clientId?: string; // OAuth client ID
     clientSecret?: string; // OAuth client secret
+    redirectUri?: string; // Preferred redirect URI for authorization requests and registration
     scopes?: string[]; // Required OAuth scopes
     accessToken?: string; // Pre-obtained access token (if available)
     refreshToken?: string; // Refresh token for renewing access
@@ -207,6 +269,7 @@ export interface ServerConfig {
     resource?: string; // OAuth resource parameter (RFC8707)
     authorizationEndpoint?: string; // Authorization endpoint (authorization code flow)
     tokenEndpoint?: string; // Token endpoint for exchanging authorization codes for tokens
+    revocationEndpoint?: string; // Token revocation endpoint (RFC 7009)
     pendingAuthorization?: {
       authorizationUrl?: string;
       state?: string;
@@ -220,7 +283,11 @@ export interface ServerConfig {
     schema?: Record<string, any>; // Complete OpenAPI JSON schema
     version?: string; // OpenAPI version (default: '3.1.0')
     security?: OpenAPISecurityConfig; // Security configuration for API calls
+    // Credential used only to download the spec document when it authenticates
+    // differently from the API (#1079); falls back to `security`.
+    specSecurity?: OpenAPISecurityConfig;
     passthroughHeaders?: string[]; // Header names to pass through from tool call requests to upstream OpenAPI endpoints
+    cookieSession?: boolean; // Opt-in: capture upstream Set-Cookie and replay on later calls, isolated per downstream MCP session
   };
 }
 
@@ -246,6 +313,7 @@ export interface OpenAPISecurityConfig {
     clientSecret?: string;
     scopes?: string[]; // Required scopes
     token?: string; // Pre-obtained access token
+    expiresAt?: number; // Access token expiration timestamp in milliseconds
   };
   // OpenID Connect
   openIdConnect?: {
@@ -259,6 +327,8 @@ export interface OpenAPISecurityConfig {
 // Server types
 export interface Server {
   name: string;
+  owner?: string;
+  visibility?: 'private' | 'group' | 'public';
   status: ServerStatus;
   error?: string;
   tools?: Tool[];
@@ -266,9 +336,16 @@ export interface Server {
   resources?: Resource[];
   config?: ServerConfig;
   enabled?: boolean;
+  // Resolved npx/uvx package version + registry update hint for stdio servers
+  // (#1166). Runtime state at the top level, like `version`.
+  packageVersion?: string;
+  latestVersion?: string;
+  updateAvailable?: boolean;
   oauth?: {
     authorizationUrl?: string;
     state?: string;
+    connected?: boolean;
+    clientIdConfigured?: boolean; // A static oauth.clientId is set (dynamic registration suppressed)
   };
 }
 
@@ -276,12 +353,16 @@ export interface Server {
 // Group server configuration - supports tool selection
 export interface IGroupServerConfig {
   name: string; // Server name
+  alias?: string; // Optional exposed name for this server within the group
   tools?: string[] | 'all'; // Array of specific tool names to include, or 'all' for all tools (default: 'all')
   prompts?: string[] | 'all'; // Array of specific prompt names to include, or 'all' for all prompts (default: 'all')
   resources?: string[] | 'all'; // Array of specific resource URIs to include, or 'all' for all resources (default: 'all')
 }
 
 export interface Group {
+  owner?: string;
+  visibility?: 'private' | 'group' | 'public';
+  sharedWithUsers?: string[];
   id: string;
   name: string;
   description?: string;
@@ -296,6 +377,7 @@ export interface EnvVar {
 
 // Form data types
 export interface ServerFormData {
+  credentialTemplate?: CredentialSlot[];
   name: string;
   description?: string;
   url: string;
@@ -306,15 +388,27 @@ export interface ServerFormData {
   env: EnvVar[];
   headers: EnvVar[];
   passthroughHeaders?: string;
+  // Visibility for non-admin users.
+  visibility?: 'private' | 'group' | 'public';
+  sharedWithUsers?: string[];
   options?: {
     timeout?: number;
     resetTimeoutOnProgress?: boolean;
     maxTotalTimeout?: number;
   };
+  // Proxychains4 proxy configuration for STDIO servers (Linux/macOS only).
+  // Round-tripped from the stored config so an edit does not drop it.
+  proxy?: ProxychainsConfig;
   keepAlive?: {
     enabled?: boolean;
     interval?: number;
   };
+  // Create a dedicated upstream client per downstream session (stateful servers)
+  perSessionClient?: boolean;
+  // On-demand spawning (stdio only): start the process on first tool call and
+  // shut it down after a period of inactivity.
+  startOnDemand?: boolean;
+  idleTimeoutMs?: number;
   oauth?: {
     clientId?: string;
     clientSecret?: string;
@@ -324,6 +418,18 @@ export interface ServerFormData {
     authorizationEndpoint?: string;
     tokenEndpoint?: string;
     resource?: string;
+    // Round-trip-only OAuth sub-fields (#1193). The form has no editors for
+    // them, so the edit/duplicate flows carry the stored values through
+    // `ServerFormData` to the submit payload instead of dropping them.
+    // Declared once here and typed by indexed access into the frontend
+    // `ServerConfig['oauth']` contract, which mirrors the backend
+    // `ServerConfig['oauth']` (src/types/index.ts) field for field, so the two
+    // shapes cannot drift and `buildServerPayload`'s `Partial<ServerConfig>`
+    // return type stays assignment-compatible without casts.
+    // Note: `dynamicRegistration` is the RFC7591 sub-object (not a boolean).
+    dynamicRegistration?: NonNullable<ServerConfig['oauth']>['dynamicRegistration'];
+    redirectUri?: NonNullable<ServerConfig['oauth']>['redirectUri'];
+    revocationEndpoint?: NonNullable<ServerConfig['oauth']>['revocationEndpoint'];
   };
   // OpenAPI specific fields
   openapi?: {
@@ -349,13 +455,27 @@ export interface ServerFormData {
     openIdConnectClientId?: string;
     openIdConnectClientSecret?: string;
     openIdConnectToken?: string;
+    // Spec-download security fields (openapi.specSecurity, #1079). oauth2 is
+    // limited to a static token (dynamic fetch only exists for the main
+    // `security`); the stored config otherwise accepts the full
+    // OpenAPISecurityConfig via JSON import.
+    specSecurityType?: 'none' | 'apiKey' | 'http' | 'oauth2';
+    specApiKeyName?: string;
+    specApiKeyIn?: 'header' | 'query' | 'cookie';
+    specApiKeyValue?: string;
+    specHttpScheme?: 'basic' | 'bearer';
+    specHttpCredentials?: string;
+    specOauth2Token?: string;
     // Passthrough headers
     passthroughHeaders?: string; // Comma-separated list of header names
+    cookieSession?: boolean; // Opt-in dynamic cookie session handling
   };
 }
 
 // Group form data types
 export interface GroupFormData {
+  visibility?: Group['visibility'];
+  sharedWithUsers?: string[];
   name: string;
   description: string;
   servers: string[] | IGroupServerConfig[]; // Updated to support new format
@@ -366,16 +486,20 @@ export interface ApiResponse<T = any> {
   success: boolean;
   message?: string;
   data?: T;
+  errors?: string[];
 }
 
 // Bearer authentication key configuration (frontend view model)
 export type BearerKeyAccessType = 'all' | 'groups' | 'servers' | 'custom';
+export type BearerKeyKind = 'system' | 'user';
 
 export interface BearerKey {
   id: string;
   name: string;
   token: string;
   enabled: boolean;
+  kind?: BearerKeyKind;
+  owner?: string;
   accessType: BearerKeyAccessType;
   allowedGroups?: string[];
   allowedServers?: string[];
@@ -392,17 +516,20 @@ export interface IUser {
 export interface User {
   username: string;
   isAdmin: boolean;
+  email?: string;
 }
 
 export interface UserFormData {
   username: string;
   password: string;
   isAdmin: boolean;
+  email?: string;
 }
 
 export interface UserUpdateData {
   isAdmin?: boolean;
   newPassword?: string;
+  email?: string;
 }
 
 export interface UserStats {
@@ -598,8 +725,10 @@ export interface Activity {
   input?: string;
   output?: string;
   group?: string;
+  username?: string;
   keyId?: string;
   keyName?: string;
+  sourceIp?: string;
   errorMessage?: string;
 }
 
@@ -615,6 +744,7 @@ export interface ActivityFilter {
   tool?: string;
   status?: ActivityStatus;
   group?: string;
+  username?: string;
   keyId?: string;
   keyName?: string;
   startDate?: string;
@@ -625,6 +755,7 @@ export interface ActivityFilterOptions {
   servers: string[];
   tools: string[];
   groups: string[];
+  usernames: string[];
   keyNames: string[];
 }
 
@@ -691,6 +822,7 @@ export interface TemplateServerConfig {
     schema?: Record<string, any>;
     version?: string;
     security?: OpenAPISecurityConfig;
+    specSecurity?: OpenAPISecurityConfig; // Spec-download credential (#1079)
     passthroughHeaders?: string[];
   };
 }
@@ -716,4 +848,61 @@ export interface TemplateImportDetail {
   name: string;
   action: 'created' | 'skipped' | 'failed';
   message?: string;
+}
+
+// Context Footprint cost DTOs
+export interface ItemCost {
+  kind: 'tool' | 'prompt' | 'resource';
+  name: string;
+  cost: number;
+  enabled: boolean;
+}
+
+export interface ServerCost {
+  name: string;
+  connected: boolean;
+  exposed: number;
+  gross: number;
+  items: ItemCost[];
+}
+
+export interface SmartRoutingCost {
+  base: number;
+  progressiveDisclosure: number;
+}
+
+export interface GroupCost {
+  id: string;
+  name: string;
+  connectedCount: number;
+  totalCount: number;
+  direct: { exposed: number; gross: number };
+  smartRouting: SmartRoutingCost | null;
+}
+
+// Effective security requirement a parsed OpenAPI spec declares (#1077).
+// Structural fields only — the spec can never supply the secret itself.
+export interface OpenAPIDeclaredSecurity {
+  declared: boolean;
+  supported: boolean;
+  prefill?: {
+    type: 'none' | 'apiKey' | 'http' | 'oauth2' | 'openIdConnect';
+    apiKey?: { name: string; in: 'header' | 'query' | 'cookie' };
+    http?: { scheme: 'basic' | 'bearer' | 'digest'; bearerFormat?: string };
+    oauth2?: { tokenUrl?: string };
+    openIdConnect?: { url?: string };
+  };
+  summary: string;
+  alternatives: number;
+  requiresCredentials: boolean;
+  unsupportedReason?: string;
+  cookieHint?: boolean;
+}
+
+// Pre-save OpenAPI import preview (#1082)
+export interface OpenApiToolStats {
+  toolCount: number;
+  definitionsBytes: number;
+  estimatedTokens: number;
+  declaredSecurity?: OpenAPIDeclaredSecurity;
 }

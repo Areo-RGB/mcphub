@@ -9,6 +9,12 @@ import {
   deleteOAuthClient,
 } from '../models/OAuth.js';
 import { IOAuthClient } from '../types/index.js';
+import { logger } from '../utils/logger.js';
+
+const canAccessClient = (req: Request, client: IOAuthClient): boolean => {
+  const user = (req as any).user as { username?: string; isAdmin?: boolean } | undefined;
+  return Boolean(user?.isAdmin || (user?.username && client.owner === user.username));
+};
 
 /**
  * GET /api/oauth/clients
@@ -17,9 +23,13 @@ import { IOAuthClient } from '../types/index.js';
 export const getAllClients = async (req: Request, res: Response): Promise<void> => {
   try {
     const clients = await getOAuthClients();
+    const user = (req as any).user as { username?: string; isAdmin?: boolean } | undefined;
+    const visibleClients = user?.isAdmin
+      ? clients
+      : clients.filter((client) => client.owner === user?.username);
 
     // Don't expose client secrets in the list
-    const sanitizedClients = clients.map((client) => ({
+    const sanitizedClients = visibleClients.map((client) => ({
       clientId: client.clientId,
       name: client.name,
       redirectUris: client.redirectUris,
@@ -33,7 +43,7 @@ export const getAllClients = async (req: Request, res: Response): Promise<void> 
       clients: sanitizedClients,
     });
   } catch (error) {
-    console.error('Get OAuth clients error:', error);
+    logger.error('Get OAuth clients error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to retrieve OAuth clients',
@@ -58,6 +68,14 @@ export const getClient = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
+    if (!canAccessClient(req, client)) {
+      res.status(403).json({
+        success: false,
+        message: 'Forbidden',
+      });
+      return;
+    }
+
     // Don't expose client secret
     const sanitizedClient = {
       clientId: client.clientId,
@@ -73,7 +91,7 @@ export const getClient = async (req: Request, res: Response): Promise<void> => {
       client: sanitizedClient,
     });
   } catch (error) {
-    console.error('Get OAuth client error:', error);
+    logger.error('Get OAuth client error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to retrieve OAuth client',
@@ -139,7 +157,7 @@ export const createClient = async (req: Request, res: Response): Promise<void> =
         : undefined,
     });
   } catch (error) {
-    console.error('Create OAuth client error:', error);
+    logger.error('Create OAuth client error:', error);
 
     if (error instanceof Error && error.message.includes('already exists')) {
       res.status(409).json({
@@ -162,6 +180,24 @@ export const createClient = async (req: Request, res: Response): Promise<void> =
 export const updateClient = async (req: Request, res: Response): Promise<void> => {
   try {
     const { clientId } = req.params;
+    const existingClient = await findOAuthClientById(clientId);
+
+    if (!existingClient) {
+      res.status(404).json({
+        success: false,
+        message: 'OAuth client not found',
+      });
+      return;
+    }
+
+    if (!canAccessClient(req, existingClient)) {
+      res.status(403).json({
+        success: false,
+        message: 'Forbidden',
+      });
+      return;
+    }
+
     const { name, redirectUris, grants, scopes } = req.body;
 
     const updates: Partial<IOAuthClient> = {};
@@ -174,9 +210,9 @@ export const updateClient = async (req: Request, res: Response): Promise<void> =
     const updatedClient = await updateOAuthClient(clientId, updates);
 
     if (!updatedClient) {
-      res.status(404).json({
+      res.status(500).json({
         success: false,
-        message: 'OAuth client not found',
+        message: 'Failed to update OAuth client',
       });
       return;
     }
@@ -195,7 +231,7 @@ export const updateClient = async (req: Request, res: Response): Promise<void> =
       },
     });
   } catch (error) {
-    console.error('Update OAuth client error:', error);
+    logger.error('Update OAuth client error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to update OAuth client',
@@ -210,6 +246,24 @@ export const updateClient = async (req: Request, res: Response): Promise<void> =
 export const deleteClient = async (req: Request, res: Response): Promise<void> => {
   try {
     const { clientId } = req.params;
+    const client = await findOAuthClientById(clientId);
+
+    if (!client) {
+      res.status(404).json({
+        success: false,
+        message: 'OAuth client not found',
+      });
+      return;
+    }
+
+    if (!canAccessClient(req, client)) {
+      res.status(403).json({
+        success: false,
+        message: 'Forbidden',
+      });
+      return;
+    }
+
     const deleted = await deleteOAuthClient(clientId);
 
     if (!deleted) {
@@ -225,7 +279,7 @@ export const deleteClient = async (req: Request, res: Response): Promise<void> =
       message: 'OAuth client deleted successfully',
     });
   } catch (error) {
-    console.error('Delete OAuth client error:', error);
+    logger.error('Delete OAuth client error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to delete OAuth client',
@@ -250,6 +304,14 @@ export const regenerateSecret = async (req: Request, res: Response): Promise<voi
       return;
     }
 
+    if (!canAccessClient(req, client)) {
+      res.status(403).json({
+        success: false,
+        message: 'Forbidden',
+      });
+      return;
+    }
+
     // Generate new secret
     const newSecret = crypto.randomBytes(32).toString('hex');
     const updatedClient = await updateOAuthClient(clientId, { clientSecret: newSecret });
@@ -269,7 +331,7 @@ export const regenerateSecret = async (req: Request, res: Response): Promise<voi
       warning: 'Client secret is only shown once. Please save it securely.',
     });
   } catch (error) {
-    console.error('Regenerate secret error:', error);
+    logger.error('Regenerate secret error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to regenerate client secret',

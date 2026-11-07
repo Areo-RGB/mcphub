@@ -1,6 +1,5 @@
 import { Request, Response } from 'express';
 import config from '../config/index.js';
-import { loadSettings } from '../config/index.js';
 import { getDataService } from '../services/services.js';
 import { DataService } from '../services/dataService.js';
 import { IUser } from '../types/index.js';
@@ -15,8 +14,21 @@ import {
   getBearerKeyDao,
 } from '../dao/DaoFactory.js';
 import { getBetterAuthRuntimeConfig } from '../services/betterAuthConfig.js';
+import { logger } from '../utils/logger.js';
 
 const dataService: DataService = getDataService();
+
+const requireAdmin = (req: Request, res: Response): boolean => {
+  const user = (req as any).user;
+  if (!user || !user.isAdmin) {
+    res.status(403).json({
+      success: false,
+      message: 'Admin privileges required',
+    });
+    return false;
+  }
+  return true;
+};
 
 /**
  * Get runtime configuration for frontend
@@ -38,7 +50,7 @@ export const getRuntimeConfig = (req: Request, res: Response): void => {
       data: runtimeConfig,
     });
   } catch (error) {
-    console.error('Error getting runtime config:', error);
+    logger.error('Error getting runtime config:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to get runtime configuration',
@@ -50,10 +62,10 @@ export const getRuntimeConfig = (req: Request, res: Response): void => {
  * Get public system configuration (only skipAuth setting)
  * This endpoint doesn't require authentication to allow checking if dashboard login should be skipped
  */
-export const getPublicConfig = (req: Request, res: Response): void => {
+export const getPublicConfig = async (req: Request, res: Response): Promise<void> => {
   try {
-    const settings = loadSettings();
-    const skipAuth = settings.systemConfig?.routing?.skipAuth || false;
+    const systemConfig = await getSystemConfigDao().get();
+    const skipAuth = systemConfig?.routing?.skipAuth || false;
     let permissions = {};
     if (skipAuth) {
       const user: IUser = {
@@ -73,11 +85,11 @@ export const getPublicConfig = (req: Request, res: Response): void => {
       data: {
         skipAuth,
         permissions,
-        betterAuth: getBetterAuthRuntimeConfig(),
+        betterAuth: await getBetterAuthRuntimeConfig(systemConfig),
       },
     });
   } catch (error) {
-    console.error('Error getting public config:', error);
+    logger.error('Error getting public config:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to get public configuration',
@@ -88,6 +100,18 @@ export const getPublicConfig = (req: Request, res: Response): void => {
 /**
  * Recursively remove null values from an object
  */
+const omitSensitiveFields = <T extends Record<string, any>, K extends keyof T & string>(
+  items: T[],
+  fields: readonly K[],
+): Omit<T, K>[] =>
+  items.map((item) => {
+    const sanitized = { ...item };
+    for (const field of fields) {
+      delete sanitized[field];
+    }
+    return sanitized;
+  });
+
 const removeNullValues = <T>(obj: T): T => {
   if (obj === null || obj === undefined) {
     return obj;
@@ -112,6 +136,8 @@ const removeNullValues = <T>(obj: T): T => {
  * Supports both full settings and individual server configuration
  */
 export const getMcpSettingsJson = async (req: Request, res: Response): Promise<void> => {
+  if (!requireAdmin(req, res)) return;
+
   try {
     const { serverName } = req.query;
     if (serverName && typeof serverName === 'string') {
@@ -167,13 +193,13 @@ export const getMcpSettingsJson = async (req: Request, res: Response): Promise<v
 
       const settings = {
         mcpServers,
-        users,
+        users: omitSensitiveFields(users, ['password']),
         groups,
         systemConfig,
         userConfigs,
-        oauthClients,
-        oauthTokens,
-        bearerKeys,
+        oauthClients: omitSensitiveFields(oauthClients, ['clientSecret']),
+        oauthTokens: omitSensitiveFields(oauthTokens, ['accessToken', 'refreshToken']),
+        bearerKeys: omitSensitiveFields(bearerKeys, ['token']),
       };
 
       res.json({
@@ -182,7 +208,7 @@ export const getMcpSettingsJson = async (req: Request, res: Response): Promise<v
       });
     }
   } catch (error) {
-    console.error('Error getting MCP settings JSON:', error);
+    logger.error('Error getting MCP settings JSON:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to get MCP settings',

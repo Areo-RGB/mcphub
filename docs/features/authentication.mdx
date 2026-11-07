@@ -1,338 +1,169 @@
 ---
 title: 'Authentication & Security'
-description: 'Configure authentication and security settings for MCPHub'
+description: 'How clients authenticate against MCPHub'
 ---
 
 ## Overview
 
-MCPHub provides flexible authentication mechanisms to secure your MCP server management platform. The system supports multiple authentication methods and role-based access control.
+MCPHub supports several stacked authentication paths. The same middleware (`src/middlewares/auth.ts`) evaluates them in order on every authenticated request:
 
-## Authentication Methods
+1. **Bearer key** — a static token created from the dashboard or `/api/auth/keys`.
+2. **MCPHub OAuth access token** — issued by MCPHub's own authorization server (optional).
+3. **Better Auth session cookie** — issued by GitHub / Google login (optional).
+4. **JWT** — issued by `POST /api/auth/login`, sent via the `x-auth-token` header or `?token=` query.
+5. **`skipAuth` guest** — only when `systemConfig.routing.skipAuth` is `true`, the dashboard API treats unauthenticated calls as a synthetic admin `guest` user.
 
-### Environment-based Authentication
+All persistent user records are stored as `{ username, password, isAdmin }`. There are no `manager` or `viewer` roles; permissions are binary (admin or not). Social accounts that log in via Better Auth live in a separate `mcphub_better_auth_*` table but are mapped to the same `username` / `isAdmin` shape at request time.
 
-Configure basic authentication using environment variables:
+### Per-server visibility
 
-```bash
-# Basic auth credentials
-AUTH_USERNAME=admin
-AUTH_PASSWORD=your-secure-password
+Each server has a `visibility` setting (`private` / `group` / `public`) that controls which non-admin users can discover and call the server. Admins always have access. The same filter is applied to dashboard listings, direct tool and prompt calls, group routes, and `$smart` routing.
 
-# JWT settings
-JWT_SECRET=your-jwt-secret-key
-JWT_EXPIRES_IN=24h
-```
+- `'private'` (default): only the server's `owner` (and admins) can see it. Servers seeded from `mcp_settings.json` migrate in with `'private'` to preserve the historical admin-only behaviour.
+- `'public'`: every authenticated user can see and call the server. Use this for servers you want to share across all users of the same MCPHub instance — including social-login users created by Better Auth.
+- `'group'`: the owner and usernames listed in the server's `sharedWithUsers` array can see and call it. Sharing grants runtime access only; selected users cannot edit or delete the server.
 
-### Database Authentication
+The visibility is editable per server from the dashboard (Server form → Advanced Options → Visibility). Edit an existing server to select local usernames for `'group'` sharing. For deployments where every user should see every server (single-user self-hosted, small trusted team), an operator can set the relevant servers to `'public'` from the dashboard.
 
-For production deployments, enable database-backed user management:
+## Login (JWT)
 
-```json
-{
-  "auth": {
-    "provider": "database",
-    "database": {
-      "url": "postgresql://user:pass@localhost:5432/mcphub",
-      "userTable": "users"
-    }
-  }
-}
-```
-
-## User Management
-
-### Creating Users
-
-Create users via the admin interface or API:
+The dashboard and any script that does not present a bearer key uses the JWT flow:
 
 ```bash
-# Via API
-curl -X POST http://localhost:3000/api/auth/users \
+curl -X POST http://localhost:3000/api/auth/login \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -d '{
-    "username": "newuser",
-    "email": "user@example.com",
-    "password": "securepassword",
-    "role": "user"
-  }'
+  -d '{ "username": "admin", "password": "your-password" }'
 ```
 
-### User Roles
-
-MCPHub supports role-based access control:
-
-- **Admin**: Full system access, user management, server configuration
-- **Manager**: Server management, group management, monitoring
-- **User**: Basic server access within assigned groups
-- **Viewer**: Read-only access to assigned resources
-
-## Group-based Access Control
-
-### Assigning Users to Groups
+The response includes a JWT. Send it on subsequent requests using the `x-auth-token` header:
 
 ```bash
-# Add user to group
-curl -X POST http://localhost:3000/api/groups/{groupId}/users \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"userId": "user123"}'
+curl http://localhost:3000/api/servers \
+  -H "x-auth-token: <jwt>"
 ```
 
-### Group Permissions
+The JWT is signed with `JWT_SECRET`. If `JWT_SECRET` is not set, MCPHub generates an ephemeral random secret at startup; this is fine for development but means every restart invalidates outstanding tokens. **Set `JWT_SECRET` explicitly in production.**
 
-Configure group-level permissions:
+Issued JWTs expire after a fixed 24 hours (`TOKEN_EXPIRY` in `src/controllers/authController.ts`); the lifetime is not configurable via environment variables.
 
-```json
-{
-  "groupId": "dev-team",
-  "permissions": {
-    "servers": ["read", "write", "execute"],
-    "tools": ["read", "execute"],
-    "logs": ["read"],
-    "config": ["read"]
-  }
-}
-```
+The first admin account is created at startup by `initializeDefaultUser()`. If no users exist, MCPHub creates `admin` and uses `ADMIN_PASSWORD` if set. When running through `pnpm dev`, it uses `admin123`; other starts generate a random password and print it to the server logs.
 
-## API Authentication
+## Bearer keys
 
-### JWT Token Authentication
+Bearer keys are long-lived static tokens managed at `/api/auth/keys`. Tokens are generated by the
+backend and returned in plaintext only once, in the create response. Later list and update responses
+contain a masked value.
 
-```javascript
-// Login to get token
-const response = await fetch('/api/auth/login', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    username: 'your-username',
-    password: 'your-password',
-  }),
-});
+| Field | Description |
+| ----- | ----------- |
+| `name` | Human-readable label. |
+| `token` | The secret value sent in the `Authorization: Bearer ...` header. |
+| `kind` | `system` for operator-managed scoped keys, or `user` for keys that inherit an owner's visibility. |
+| `owner` | Required for user-level keys. |
+| `accessType` | `all` (dashboard + MCP), or a scoped value enforced inside `sseService.ts` for MCP-only access. |
+| `enabled` | Disabled keys are ignored without being deleted. |
 
-const { token } = await response.json();
+Admins can create and manage all keys. Regular users can create, rename, enable, disable and delete
+their own user-level keys from the settings page. User-level keys are MCP transport credentials only:
+they are never accepted by the dashboard / management API. When used on `/mcp`, `/mcp/$smart` or a
+group/server endpoint, MCPHub resolves the current owner record and applies that user's live server
+visibility. The optional `/:user/mcp/...` routes remain supported, but the URL username must match the
+key owner.
 
-// Use token for authenticated requests
-const serversResponse = await fetch('/api/servers', {
-  headers: { Authorization: `Bearer ${token}` },
-});
-```
+System-level keys preserve the original scoped-key behavior. Only system-level keys with
+`accessType === 'all'` are accepted by the dashboard / management API middleware. Restricted
+system-level keys are enforced at the MCP transport layer.
 
-### API Key Authentication
+The header name can be customized via `systemConfig.routing.bearerAuthHeaderName` (default `Authorization`). The legacy `systemConfig.routing.bearerAuthKey` field is preserved only for one-time migration into the bearer key store.
 
-For service-to-service communication:
+To globally turn off bearer auth on MCP endpoints, set `systemConfig.routing.enableBearerAuth` to `false`.
 
-```bash
-# Generate API key
-curl -X POST http://localhost:3000/api/auth/api-keys \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -d '{
-    "name": "my-service",
-    "permissions": ["servers:read", "tools:execute"]
-  }'
+## MCPHub OAuth authorization server
 
-# Use API key
-curl -H "X-API-Key: your-api-key" \
-  http://localhost:3000/api/servers
-```
+When `systemConfig.oauthServer.enabled` is `true`, MCPHub exposes an OAuth 2.0 / OIDC-compatible server (`@node-oauth/oauth2-server`). Endpoints:
 
-## Security Configuration
+| Method & Path | Purpose |
+| ------------- | ------- |
+| `GET /oauth/authorize`, `POST /oauth/authorize` | Authorization endpoint (PKCE supported). |
+| `POST /oauth/token` | Token endpoint. |
+| `GET /oauth/userinfo` | OIDC-style userinfo (also validates an access token). |
+| `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata. |
+| `GET /.well-known/oauth-protected-resource` | Protected resource metadata. |
+| `POST /oauth/register`, `GET/PUT/DELETE /oauth/register/:clientId` | RFC 7591 dynamic client registration. |
+| `GET/POST/PUT/DELETE /api/oauth/clients[...]` | Admin-only client CRUD. |
 
-### HTTPS Setup
+OAuth access tokens issued here are accepted by `src/middlewares/auth.ts`.
 
-Configure HTTPS for production:
+## Better Auth (GitHub / Google / local OIDC)
 
-```yaml
-# docker-compose.yml
-services:
-  mcphub:
-    environment:
-      - HTTPS_ENABLED=true
-      - SSL_CERT_PATH=/certs/cert.pem
-      - SSL_KEY_PATH=/certs/key.pem
-    volumes:
-      - ./certs:/certs:ro
-```
+Better Auth is optional and initialized once at process startup. That means any change to either `BETTER_AUTH_*` environment variables or stored `systemConfig.auth.betterAuth` values still requires a restart.
 
-### CORS Configuration
+Non-secret Better Auth settings can now live either in environment variables or in `systemConfig.auth.betterAuth` (from `mcp_settings.json` or the database-backed system config). The priority order is:
 
-Configure CORS for web applications:
+1. `BETTER_AUTH_*` environment variables
+2. `systemConfig.auth.betterAuth`
+3. Built-in defaults
 
-```json
-{
-  "cors": {
-    "origin": ["https://your-frontend.com"],
-    "credentials": true,
-    "methods": ["GET", "POST", "PUT", "DELETE"]
-  }
-}
-```
+Provider credentials remain environment-variable only. Required variables (see `.env.example`):
 
-### Rate Limiting
+- `BETTER_AUTH_ENABLED` — master switch for Better Auth.
+- `BETTER_AUTH_URL` — public base URL of MCPHub (used to build redirect URIs).
+- `BETTER_AUTH_BASE_PATH` — optional mount path override for the Better Auth handler.
+- `BETTER_AUTH_TRUSTED_ORIGINS` — optional extra trusted origins (comma-separated, whitespace-separated, or JSON array).
+- `BETTER_AUTH_GOOGLE_ENABLED` — enable / disable Google login when credentials are present.
+- `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` — for Google login.
+- `BETTER_AUTH_GITHUB_ENABLED` — enable / disable GitHub login when credentials are present.
+- `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` — for GitHub login.
+- `BETTER_AUTH_OIDC_ENABLED` — enable / disable the generic OIDC provider.
+- `BETTER_AUTH_OIDC_PROVIDER_ID` — OIDC provider identifier (defaults to `oidc`).
+- `BETTER_AUTH_OIDC_DISCOVERY_URL` — discovery URL for a local issuer.
+- `BETTER_AUTH_OIDC_SCOPES` — optional requested scopes for local OIDC login.
+- `BETTER_AUTH_OIDC_PKCE` — optional PKCE toggle for local OIDC login.
+- `BETTER_AUTH_OIDC_PROMPT` — optional `prompt` parameter for local OIDC login.
+- `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` — for a local OIDC provider.
 
-Protect against abuse with rate limiting:
+For a local issuer (for example Keycloak, Authentik, or Dex), you can either configure the metadata entirely through environment variables, or keep the non-secret values in `systemConfig.auth.betterAuth.providers.oidc` with:
 
-```json
-{
-  "rateLimit": {
-    "windowMs": 900000,
-    "max": 100,
-    "message": "Too many requests from this IP"
-  }
-}
-```
+- `enabled`
+- `providerId`
+- `discoveryUrl`
+- optional `scopes`, `pkce`, and `prompt`
 
-## Session Management
+The `discoveryUrl` should point at the provider's `/.well-known/openid-configuration` endpoint. `OIDC_DISCOVERY_URL` remains supported as a legacy alias for `BETTER_AUTH_OIDC_DISCOVERY_URL`, and it can still be referenced from config files via `${OIDC_DISCOVERY_URL}`. The login page shows a generic **Continue with OIDC** button when this provider is enabled.
 
-### Session Configuration
+If the dashboard runs behind a different public origin, set `BETTER_AUTH_TRUSTED_ORIGINS` (or `systemConfig.auth.betterAuth.trustedOrigins`) to allow that origin to start the login flow. If no explicit trusted origins are configured, MCPHub automatically trusts the origins from `BETTER_AUTH_URL` and `systemConfig.install.baseUrl` when they are set.
 
-```json
-{
-  "session": {
-    "secret": "your-session-secret",
-    "cookie": {
-      "secure": true,
-      "httpOnly": true,
-      "maxAge": 86400000
-    },
-    "store": "redis",
-    "redis": {
-      "host": "localhost",
-      "port": 6379
-    }
-  }
-}
-```
+<Note>
+  Better Auth in MCPHub currently requires PostgreSQL-backed storage (`DB_URL`). File-only mode does not support Better Auth sessions, including local OIDC login.
+</Note>
 
-### Logout and Session Cleanup
+When enabled, Better Auth mounts at `${BASE_PATH}${betterAuthConfig.basePath}` (default `/api/auth/better`). `BETTER_AUTH_BASE_PATH` overrides the stored `betterAuth.basePath` value at startup. A valid Better Auth session cookie counts as authentication for the dashboard API. The mapped MCPHub user is admin only if a local user with the same username exists and is marked admin.
 
-```javascript
-// Logout endpoint
-app.post('/api/auth/logout', (req, res) => {
-  req.session.destroy();
-  res.json({ message: 'Logged out successfully' });
-});
-```
+Local OIDC login follows the same mapping rule as GitHub / Google login: MCPHub resolves a local username from the Better Auth session (`email ?? name ?? id`). If that username does not exist yet, MCPHub auto-creates a **non-admin** local user. OIDC login never auto-promotes a user to admin.
 
-## Security Best Practices
+## Read-only mode
 
-### Password Security
+Set `READONLY=true` to prevent any mutating request from succeeding. The middleware permits:
 
-- Use strong password requirements
-- Implement password hashing with bcrypt
-- Support password reset functionality
-- Enable two-factor authentication (2FA)
+- All `GET` requests.
+- All paths starting with `${basePath}/tools/` (so OpenAPI tool execution still works).
 
-### Token Security
+Other methods receive `403`.
 
-- Use secure JWT secrets
-- Implement token rotation
-- Set appropriate expiration times
-- Store tokens securely in httpOnly cookies
+## Skip-auth mode (local development only)
 
-### Network Security
+<Warning>
+  **`skipAuth` disables dashboard authentication entirely.** When `systemConfig.routing.skipAuth = true`, every unauthenticated request to `${basePath}/api/*` is automatically treated as a synthetic admin user (`{ username: 'guest', isAdmin: true }`). Anyone who can reach the API — including a misconfigured reverse proxy, a forgotten port-forward, or a public cloud IP — gets full administrative access: they can read every server's secrets, create / delete users, mint bearer keys, and exfiltrate the entire `mcp_settings.json`. **Never enable this in staging, production, demo, or any deployment that is reachable beyond `localhost`.** Bind MCPHub to `127.0.0.1` while developing, and double-check that `skipAuth` is `false` before deploying. MCP transport routes (`/mcp/*`, `/sse/*`) are not affected by `skipAuth` and continue to require their own credentials.
+</Warning>
 
-- Use HTTPS in production
-- Implement proper CORS policies
-- Enable request validation
-- Use security headers (helmet.js)
+The flag exists purely to make local iteration painless: you can hit the dashboard API from `curl` or a frontend dev server without pasting a JWT. If you need API access from automated tooling instead, prefer a scoped bearer key (`/api/auth/keys`) over `skipAuth`.
 
-### Monitoring Security Events
+## Password policy
 
-```javascript
-// Log security events
-const auditLog = {
-  event: 'login_attempt',
-  user: username,
-  ip: req.ip,
-  userAgent: req.headers['user-agent'],
-  success: true,
-  timestamp: new Date(),
-};
-```
+Local user passwords are validated by `src/utils/passwordValidation.ts` (length and character-class rules). Failed validations on `POST /api/users` or `PUT /api/users/:username` return `400` with the failed checks under `errors`.
 
-## Troubleshooting
+## See also
 
-### Common Authentication Issues
-
-**Invalid Credentials**
-
-```bash
-# Check user exists and password is correct
-curl -X POST http://localhost:3000/api/auth/verify \
-  -d '{"username": "user", "password": "pass"}'
-```
-
-**Token Expiration**
-
-```javascript
-// Handle token refresh
-if (response.status === 401) {
-  const newToken = await refreshToken();
-  // Retry request with new token
-}
-```
-
-**Permission Denied**
-
-```bash
-# Check user permissions
-curl -H "Authorization: Bearer $TOKEN" \
-  http://localhost:3000/api/auth/permissions
-```
-
-### Debug Authentication
-
-Enable authentication debugging:
-
-```bash
-DEBUG=mcphub:auth npm start
-```
-
-## Integration Examples
-
-### Frontend Integration
-
-```javascript
-// React authentication hook
-const useAuth = () => {
-  const [user, setUser] = useState(null);
-
-  const login = async (credentials) => {
-    const response = await fetch('/api/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(credentials),
-    });
-
-    if (response.ok) {
-      const userData = await response.json();
-      setUser(userData.user);
-      return true;
-    }
-    return false;
-  };
-
-  return { user, login };
-};
-```
-
-### Middleware Integration
-
-```javascript
-// Express middleware
-const authMiddleware = (req, res, next) => {
-  const token = req.headers.authorization?.split(' ')[1];
-
-  if (!token) {
-    return res.status(401).json({ error: 'No token provided' });
-  }
-
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded;
-    next();
-  } catch (error) {
-    res.status(401).json({ error: 'Invalid token' });
-  }
-};
-```
+- [Users API](/api-reference/users) — local user CRUD.
+- [OAuth API](/api-reference/auth) — OAuth client management endpoints.
+- [MCP Settings](/configuration/mcp-settings) — where `routing`, `oauth`, and `auth.betterAuth` configuration lives.

@@ -81,6 +81,9 @@ jest.mock('../dao/index.js', () => ({
   getServerDao: jest.fn(() => ({
     findById: jest.fn().mockResolvedValue(null),
   })),
+  getUserDao: jest.fn(() => ({
+    findByUsername: jest.fn().mockResolvedValue(null),
+  })),
 }));
 
 // Mock oauthBearer
@@ -92,6 +95,9 @@ jest.mock('./userContextService.js', () => ({
   UserContextService: {
     getInstance: jest.fn(() => ({
       getCurrentUser: jest.fn(() => ({ username: 'testuser' })),
+      hasUser: jest.fn(() => true),
+      setCurrentUser: jest.fn(),
+      clearCurrentUser: jest.fn(),
     })),
   },
 }));
@@ -120,7 +126,7 @@ import { UserContextService } from './userContextService.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
-import { getBearerKeyDao, getGroupDao } from '../dao/index.js';
+import { getBearerKeyDao, getGroupDao, getUserDao } from '../dao/index.js';
 
 // Helper function to update the mock system config
 const setMockSystemConfig = (config: Partial<typeof defaultSystemConfig>) => {
@@ -151,6 +157,17 @@ const mockStreamableHTTPServerTransport = {
   connect: jest.fn(),
   handleRequest: jest.fn(),
   onclose: null,
+  _webStandardTransport: {
+    sessionId: undefined as string | undefined,
+    _initialized: false,
+  },
+};
+
+const resetMockStreamableHTTPServerTransport = () => {
+  mockStreamableHTTPServerTransport.sessionId = 'test-session-id';
+  mockStreamableHTTPServerTransport.onclose = null;
+  mockStreamableHTTPServerTransport._webStandardTransport.sessionId = undefined;
+  mockStreamableHTTPServerTransport._webStandardTransport._initialized = false;
 };
 
 // Mock Express Request and Response
@@ -217,6 +234,13 @@ const expectBearerUnauthorized = (
 describe('sseService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    resetMockStreamableHTTPServerTransport();
+    (UserContextService.getInstance as jest.MockedFunction<any>).mockReturnValue({
+      getCurrentUser: jest.fn(() => ({ username: 'testuser' })),
+      hasUser: jest.fn(() => true),
+      setCurrentUser: jest.fn(),
+      clearCurrentUser: jest.fn(),
+    });
 
     // Reset settings cache to default
     setMockSystemConfig({
@@ -351,6 +375,133 @@ describe('sseService', () => {
 
       expect(res.status).not.toHaveBeenCalledWith(401);
       expect(SSEServerTransport).toHaveBeenCalled();
+    });
+
+    it('should allow group-scoped bearer keys on smart routing group paths (issue #784)', async () => {
+      setMockSystemConfig({
+        routing: {
+          enableGlobalRoute: true,
+          enableGroupNameRoute: true,
+          enableBearerAuth: true,
+          bearerAuthKey: 'group-token',
+          skipAuth: false,
+        },
+      });
+
+      (getBearerKeyDao as jest.MockedFunction<any>).mockReturnValueOnce({
+        findEnabled: jest.fn().mockResolvedValue([
+          {
+            id: 'smart-group-key-id',
+            name: 'smart-group-key',
+            token: 'group-token',
+            enabled: true,
+            accessType: 'groups',
+            allowedGroups: ['my-group'],
+            allowedServers: [],
+          },
+        ]),
+      });
+
+      (getGroupDao as jest.MockedFunction<any>).mockReturnValueOnce({
+        findByName: jest
+          .fn()
+          .mockImplementation((name: string) =>
+            name === 'my-group'
+              ? Promise.resolve({ id: 'my-group-id', name: 'my-group', servers: [] })
+              : Promise.resolve(null),
+          ),
+        findById: jest.fn().mockResolvedValue(null),
+      });
+
+      const req = createMockRequest({
+        headers: { authorization: 'Bearer group-token' },
+        params: { group: '$smart/my-group' },
+      });
+      const res = createMockResponse();
+
+      await handleSseConnection(req, res);
+
+      expect(res.status).not.toHaveBeenCalledWith(401);
+      expect(SSEServerTransport).toHaveBeenCalled();
+    });
+
+    it('restores user context from a user-level key on the unified MCP route', async () => {
+      (getBearerKeyDao as jest.MockedFunction<any>).mockReturnValueOnce({
+        findEnabled: jest.fn().mockResolvedValue([
+          {
+            id: 'alice-key-id',
+            name: 'alice-key',
+            token: 'alice-token',
+            enabled: true,
+            kind: 'user',
+            owner: 'alice',
+            accessType: 'all',
+          },
+        ]),
+      });
+      (getUserDao as jest.MockedFunction<any>).mockReturnValueOnce({
+        findByUsername: jest.fn().mockResolvedValue({
+          username: 'alice',
+          password: '',
+          isAdmin: false,
+        }),
+      });
+      const setCurrentUser = jest.fn();
+      (UserContextService.getInstance as jest.MockedFunction<any>).mockReturnValue({
+        getCurrentUser: jest.fn(() => null),
+        hasUser: jest.fn(() => false),
+        setCurrentUser,
+        clearCurrentUser: jest.fn(),
+      });
+      const req = createMockRequest({
+        headers: { authorization: 'Bearer alice-token' },
+        params: {},
+      });
+      const res = createMockResponse();
+
+      await handleSseConnection(req, res);
+
+      expect(res.status).not.toHaveBeenCalledWith(401);
+      expect(setCurrentUser).toHaveBeenCalledWith(
+        expect.objectContaining({ username: 'alice', isAdmin: false }),
+      );
+      expect(SSEServerTransport).toHaveBeenCalled();
+    });
+
+    it('rejects a user-level key when the username path does not match its owner', async () => {
+      (getBearerKeyDao as jest.MockedFunction<any>).mockReturnValueOnce({
+        findEnabled: jest.fn().mockResolvedValue([
+          {
+            id: 'alice-key-id',
+            name: 'alice-key',
+            token: 'alice-token',
+            enabled: true,
+            kind: 'user',
+            owner: 'alice',
+            accessType: 'all',
+          },
+        ]),
+      });
+      (getUserDao as jest.MockedFunction<any>).mockReturnValueOnce({
+        findByUsername: jest.fn().mockResolvedValue({
+          username: 'alice',
+          password: '',
+          isAdmin: false,
+        }),
+      });
+      const req = createMockRequest({
+        headers: { authorization: 'Bearer alice-token' },
+        params: { user: 'bob' },
+      });
+      const res = createMockResponse();
+
+      await handleSseConnection(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(res.json).toHaveBeenCalledWith({
+        error: 'forbidden',
+        error_description: 'Bearer key owner does not match the requested user',
+      });
     });
   });
 
@@ -581,11 +732,13 @@ describe('sseService', () => {
 
       // Override group DAO so isBearerKeyAllowedForRequest can find the group for this test only
       (getGroupDao as jest.MockedFunction<any>).mockReturnValueOnce({
-        findByName: jest.fn().mockImplementation((name: string) =>
-          name === 'my-group'
-            ? Promise.resolve({ id: 'group-uuid', name: 'my-group', servers: [] })
-            : Promise.resolve(null),
-        ),
+        findByName: jest
+          .fn()
+          .mockImplementation((name: string) =>
+            name === 'my-group'
+              ? Promise.resolve({ id: 'group-uuid', name: 'my-group', servers: [] })
+              : Promise.resolve(null),
+          ),
         findById: jest.fn().mockResolvedValue(null),
       });
 
@@ -693,12 +846,12 @@ describe('sseService', () => {
       await handleMcpPostRequest(req, res);
 
       // When session rebuild is disabled, invalid sessions should return an error
-      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.status).toHaveBeenCalledWith(404);
       expect(res.json).toHaveBeenCalledWith({
         jsonrpc: '2.0',
         error: {
-          code: -32000,
-          message: 'Bad Request: No valid session ID provided',
+          code: -32001,
+          message: 'Session not found. Please reinitialize the session.',
         },
         id: null,
       });
@@ -732,6 +885,89 @@ describe('sseService', () => {
         StreamableHTTPServerTransport as jest.MockedClass<typeof StreamableHTTPServerTransport>
       ).mock.results[0].value as typeof mockStreamableHTTPServerTransport;
       expect(mockInstance.handleRequest).toHaveBeenCalledWith(req, res, req.body);
+    });
+
+    it('should rebuild sessions without issuing synthetic initialize requests', async () => {
+      setMockSystemConfig({
+        routing: {
+          enableGlobalRoute: true,
+          enableGroupNameRoute: true,
+          enableBearerAuth: false,
+          bearerAuthKey: 'test-key',
+          skipAuth: false,
+        },
+        enableSessionRebuild: true,
+      });
+
+      const req = createMockRequest({
+        params: { group: 'test-group' },
+        headers: { 'mcp-session-id': 'rebuilt-session' },
+        body: {
+          method: 'tools/call',
+          params: {
+            name: 'test-server::get_current_time',
+            arguments: {},
+          },
+        },
+      });
+      const res = createMockResponse();
+
+      await handleMcpPostRequest(req, res);
+
+      expect(mockStreamableHTTPServerTransport._webStandardTransport.sessionId).toBe(
+        'rebuilt-session',
+      );
+      expect(mockStreamableHTTPServerTransport._webStandardTransport._initialized).toBe(true);
+      expect(mockStreamableHTTPServerTransport.handleRequest).toHaveBeenCalledTimes(1);
+      expect(mockStreamableHTTPServerTransport.handleRequest).toHaveBeenCalledWith(
+        req,
+        res,
+        req.body,
+      );
+    });
+
+    it('should return an explicit session-not-found error when rebuilt transport is still not initialized', async () => {
+      setMockSystemConfig({
+        routing: {
+          enableGlobalRoute: true,
+          enableGroupNameRoute: true,
+          enableBearerAuth: false,
+          bearerAuthKey: 'test-key',
+          skipAuth: false,
+        },
+        enableSessionRebuild: true,
+      });
+
+      mockStreamableHTTPServerTransport.handleRequest.mockRejectedValueOnce(
+        new Error('Server not initialized'),
+      );
+
+      const req = createMockRequest({
+        params: { group: 'test-group' },
+        headers: { 'mcp-session-id': 'broken-session' },
+        body: {
+          method: 'tools/call',
+          params: {
+            name: 'test-server::get_current_time',
+            arguments: {},
+          },
+        },
+      });
+      const res = createMockResponse();
+
+      await handleMcpPostRequest(req, res);
+
+      expect(mockStreamableHTTPServerTransport.handleRequest).toHaveBeenCalledTimes(1);
+      expect(res.status).toHaveBeenCalledWith(404);
+      expect(res.json).toHaveBeenCalledWith({
+        jsonrpc: '2.0',
+        error: {
+          code: -32001,
+          message: 'Session not found. Please reinitialize the session.',
+        },
+        id: null,
+      });
+      expect(transports['broken-session']).toBeUndefined();
     });
 
     it('should return 401 when bearer auth fails', async () => {
@@ -781,6 +1017,127 @@ describe('sseService', () => {
       expect(res.status).toHaveBeenCalledWith(200);
       expect(res.end).toHaveBeenCalled();
       expect(StreamableHTTPServerTransport).not.toHaveBeenCalled();
+    });
+
+    describe('bearer key group scope escalation (GHSA-454m-4vm6-842f)', () => {
+      // Regression tests for the "any-overlap" group authorization flaw:
+      // a servers/custom-scoped bearer key must NOT gain access to every server
+      // in a group just because one group member appears in allowedServers.
+      const postToTeamGroup = async (key: Record<string, unknown>) => {
+        (getBearerKeyDao as jest.MockedFunction<any>).mockReturnValueOnce({
+          findEnabled: jest.fn().mockResolvedValue([key]),
+        });
+        (getGroupDao as jest.MockedFunction<any>).mockReturnValueOnce({
+          findByName: jest.fn().mockImplementation((name: string) =>
+            name === 'team-group'
+              ? Promise.resolve({
+                  id: 'team-group-uuid',
+                  name: 'team-group',
+                  servers: ['public-server', 'secret-server'],
+                })
+              : Promise.resolve(null),
+          ),
+          findById: jest.fn().mockResolvedValue(null),
+        });
+
+        setMockSystemConfig({
+          routing: {
+            enableGlobalRoute: true,
+            enableGroupNameRoute: true,
+            enableBearerAuth: true,
+            bearerAuthKey: 'scoped-token',
+            skipAuth: false,
+          },
+          enableSessionRebuild: false,
+        });
+
+        const req = createMockRequest({
+          params: { group: 'team-group' },
+          body: { jsonrpc: '2.0', method: 'tools/list', id: 1 },
+          headers: { authorization: 'Bearer scoped-token' },
+        });
+        const res = createMockResponse();
+
+        await handleMcpPostRequest(req, res);
+        return res;
+      };
+
+      const scopedKey = (overrides: Record<string, unknown> = {}) => ({
+        id: 'key-1',
+        name: 'contractor-key',
+        token: 'scoped-token',
+        enabled: true,
+        accessType: 'servers',
+        allowedGroups: [],
+        allowedServers: ['public-server'],
+        ...overrides,
+      });
+
+      it('denies a servers-scoped key access to a group containing a non-allowed server', async () => {
+        // Key is only granted public-server, but team-group also contains secret-server.
+        const res = await postToTeamGroup(scopedKey());
+        expectBearerUnauthorized(res, 'Invalid bearer token');
+      });
+
+      it('denies a custom-scoped key whose allowedServers overlap only partially with a group', async () => {
+        const res = await postToTeamGroup(scopedKey({ accessType: 'custom', allowedGroups: [] }));
+        expectBearerUnauthorized(res, 'Invalid bearer token');
+      });
+
+      it('allows a servers-scoped key when every server in the group is allowed', async () => {
+        const res = await postToTeamGroup(
+          scopedKey({ allowedServers: ['public-server', 'secret-server'] }),
+        );
+        expect(res.status).not.toHaveBeenCalledWith(401);
+      });
+
+      it('allows a custom-scoped key when the group itself is in allowedGroups', async () => {
+        const res = await postToTeamGroup(
+          scopedKey({
+            accessType: 'custom',
+            allowedGroups: ['team-group'],
+            allowedServers: [],
+          }),
+        );
+        expect(res.status).not.toHaveBeenCalledWith(401);
+      });
+
+      it('denies a servers-scoped key for an empty group (no servers to contain)', async () => {
+        (getBearerKeyDao as jest.MockedFunction<any>).mockReturnValueOnce({
+          findEnabled: jest.fn().mockResolvedValue([scopedKey()]),
+        });
+        (getGroupDao as jest.MockedFunction<any>).mockReturnValueOnce({
+          findByName: jest
+            .fn()
+            .mockImplementation((name: string) =>
+              name === 'empty-group'
+                ? Promise.resolve({ id: 'empty-group-uuid', name: 'empty-group', servers: [] })
+                : Promise.resolve(null),
+            ),
+          findById: jest.fn().mockResolvedValue(null),
+        });
+
+        setMockSystemConfig({
+          routing: {
+            enableGlobalRoute: true,
+            enableGroupNameRoute: true,
+            enableBearerAuth: true,
+            bearerAuthKey: 'scoped-token',
+            skipAuth: false,
+          },
+          enableSessionRebuild: false,
+        });
+
+        const req = createMockRequest({
+          params: { group: 'empty-group' },
+          body: { jsonrpc: '2.0', method: 'tools/list', id: 1 },
+          headers: { authorization: 'Bearer scoped-token' },
+        });
+        const res = createMockResponse();
+
+        await handleMcpPostRequest(req, res);
+        expectBearerUnauthorized(res, 'Invalid bearer token');
+      });
     });
   });
 
@@ -840,9 +1197,9 @@ describe('sseService', () => {
 
       await handleMcpOtherRequest(req, res);
 
-      // Should return 400 error when session rebuild is disabled
-      expect(res.status).toHaveBeenCalledWith(400);
-      expect(res.send).toHaveBeenCalledWith('Invalid or missing session ID');
+      // Should return 404 error when session rebuild is disabled
+      expect(res.status).toHaveBeenCalledWith(404);
+      expect(res.send).toHaveBeenCalledWith('Session not found. Please reinitialize the session.');
     });
 
     it('should transparently rebuild invalid session in handleMcpOtherRequest when enabled', async () => {

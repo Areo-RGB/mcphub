@@ -2,6 +2,7 @@ import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import { IUser } from '../types/index.js';
 import { getUserDao } from '../dao/index.js';
+import { logger } from '../utils/logger.js';
 
 const isDuplicateUserError = (error: unknown): boolean => {
   if (!error || typeof error !== 'object') {
@@ -33,7 +34,7 @@ export const getUsers = async (): Promise<IUser[]> => {
     const userDao = getUserDao();
     return await userDao.findAll();
   } catch (error) {
-    console.error('Error reading users:', error);
+    logger.error('Error reading users:', error);
     return [];
   }
 };
@@ -46,10 +47,12 @@ export const createUser = async (userData: IUser): Promise<IUser | null> => {
       userData.username,
       userData.password,
       userData.isAdmin,
+      userData.email ?? undefined,
+      userData.ssoUserId ?? undefined,
     );
   } catch (error) {
     if (!isDuplicateUserError(error)) {
-      console.error('Error creating user:', error);
+      logger.error('Error creating user:', error);
     }
     return null;
   }
@@ -62,7 +65,31 @@ export const findUserByUsername = async (username: string): Promise<IUser | unde
     const user = await userDao.findByUsername(username);
     return user || undefined;
   } catch (error) {
-    console.error('Error finding user:', error);
+    logger.error('Error finding user:', error);
+    return undefined;
+  }
+};
+
+// Find user by email
+export const findUserByEmail = async (email: string): Promise<IUser | undefined> => {
+  try {
+    const userDao = getUserDao();
+    const user = await userDao.findByEmail(email);
+    return user || undefined;
+  } catch (error) {
+    logger.error('Error finding user by email:', error);
+    return undefined;
+  }
+};
+
+// Find user by SSO user ID (Better Auth user.id, stable across email changes)
+export const findUserBySsoUserId = async (ssoUserId: string): Promise<IUser | undefined> => {
+  try {
+    const userDao = getUserDao();
+    const user = await userDao.findBySsoUserId(ssoUserId);
+    return user || undefined;
+  } catch (error) {
+    logger.error('Error finding user by ssoUserId:', error);
     return undefined;
   }
 };
@@ -84,7 +111,7 @@ export const updateUserPassword = async (
     const userDao = getUserDao();
     return await userDao.updatePassword(username, newPassword);
   } catch (error) {
-    console.error('Error updating password:', error);
+    logger.error('Error updating password:', error);
     return false;
   }
 };
@@ -103,16 +130,28 @@ export const initializeDefaultUser = async (): Promise<void> => {
   const users = await userDao.findAll();
 
   if (users.length === 0) {
-    const adminPasswordFromEnv = process.env.ADMIN_PASSWORD;
-    const password = adminPasswordFromEnv || generateRandomPassword();
-    await userDao.createWithHashedPassword('admin', password, true);
-    console.log('Default admin user created');
+    const createDefaultAdmin = async (password: string): Promise<void> => {
+      await userDao.createWithHashedPassword('admin', password, true);
+      logger.log('Default admin user created');
+    };
 
-    if (!adminPasswordFromEnv) {
-      console.log('========================================');
-      console.log('  Generated admin password: ' + password);
-      console.log('  Please change this password after first login.');
-      console.log('========================================');
+    const adminPasswordFromEnv = process.env.ADMIN_PASSWORD;
+    if (adminPasswordFromEnv) {
+      await createDefaultAdmin(adminPasswordFromEnv);
+      return;
     }
+
+    if (process.env.NODE_ENV === 'development') {
+      await createDefaultAdmin('admin123');
+      logger.log('Using development admin password: admin123');
+      return;
+    }
+
+    const generatedPassword = generateRandomPassword();
+    await createDefaultAdmin(generatedPassword);
+    logger.log('========================================');
+    logger.log('  Generated admin password: ' + generatedPassword);
+    logger.log('  Please change this password after first login.');
+    logger.log('========================================');
   }
 };

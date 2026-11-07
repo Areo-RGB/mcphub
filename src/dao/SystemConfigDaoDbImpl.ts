@@ -1,4 +1,4 @@
-import { SystemConfigDao } from './index.js';
+import { migrateLegacySmartRoutingConfig, SystemConfigDao } from './SystemConfigDao.js';
 import { SystemConfig } from '../types/index.js';
 import { SystemConfigRepository } from '../db/repositories/SystemConfigRepository.js';
 
@@ -13,17 +13,27 @@ export class SystemConfigDaoDbImpl implements SystemConfigDao {
   }
 
   async get(): Promise<SystemConfig> {
-    const config = await this.repository.get();
+    let config = await this.repository.get();
+    const { smartRouting, migrated } = migrateLegacySmartRoutingConfig(
+      config.smartRouting as SystemConfig['smartRouting'],
+    );
+    if (migrated) {
+      config = await this.repository.update({ smartRouting: smartRouting as Record<string, any> });
+    }
+
     return {
       routing: config.routing as any,
       install: config.install as any,
       smartRouting: config.smartRouting as any,
+      toolResultCompression: config.toolResultCompression as any,
       mcpRouter: config.mcpRouter as any,
       nameSeparator: config.nameSeparator,
       oauth: config.oauth as any,
       oauthServer: config.oauthServer as any,
       auth: config.auth as any,
       enableSessionRebuild: config.enableSessionRebuild,
+      discovery: config.discovery as any,
+      activityLog: config.activityLog as any,
     };
   }
 
@@ -33,12 +43,15 @@ export class SystemConfigDaoDbImpl implements SystemConfigDao {
       routing: updated.routing as any,
       install: updated.install as any,
       smartRouting: updated.smartRouting as any,
+      toolResultCompression: updated.toolResultCompression as any,
       mcpRouter: updated.mcpRouter as any,
       nameSeparator: updated.nameSeparator,
       oauth: updated.oauth as any,
       oauthServer: updated.oauthServer as any,
       auth: updated.auth as any,
       enableSessionRebuild: updated.enableSessionRebuild,
+      discovery: updated.discovery as any,
+      activityLog: updated.activityLog as any,
     };
   }
 
@@ -48,12 +61,15 @@ export class SystemConfigDaoDbImpl implements SystemConfigDao {
       routing: config.routing as any,
       install: config.install as any,
       smartRouting: config.smartRouting as any,
+      toolResultCompression: config.toolResultCompression as any,
       mcpRouter: config.mcpRouter as any,
       nameSeparator: config.nameSeparator,
       oauth: config.oauth as any,
       oauthServer: config.oauthServer as any,
       auth: config.auth as any,
       enableSessionRebuild: config.enableSessionRebuild,
+      discovery: config.discovery as any,
+      activityLog: config.activityLog as any,
     };
   }
 

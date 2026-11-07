@@ -5,12 +5,18 @@ import {
   TemplateExportOptions,
   TemplateImportResult,
   TemplateImportDetail,
+  IGroup,
   IGroupServerConfig,
   ServerConfig,
 } from '../types/index.js';
 import { getServerDao, getGroupDao } from '../dao/index.js';
+import type { ServerConfigWithName } from '../dao/ServerDao.js';
+import { isPrivilegedServerConfig } from '../utils/serverConfigValidation.js';
+import { validateServerName } from '../utils/serverNameValidation.js';
 import { createGroup } from './groupService.js';
 import { addServer } from './mcpService.js';
+import { getDataService } from './services.js';
+import type { IUser } from '../types/index.js';
 
 const TEMPLATE_VERSION = '1.0';
 
@@ -23,8 +29,16 @@ type TemplateOpenApiSecurityConfig = NonNullable<TemplateOpenApiConfig['security
 
 // Fields that commonly contain secrets and should be replaced with placeholders
 const SECRET_ENV_KEYS = new Set([
-  'api_key', 'apikey', 'secret', 'token', 'password', 'passwd',
-  'access_key', 'secret_key', 'private_key', 'auth',
+  'api_key',
+  'apikey',
+  'secret',
+  'token',
+  'password',
+  'passwd',
+  'access_key',
+  'secret_key',
+  'private_key',
+  'auth',
 ]);
 
 function extractPlaceholderName(value: string): string | null {
@@ -33,11 +47,17 @@ function extractPlaceholderName(value: string): string | null {
 }
 
 function toPlaceholderName(value: string, fallback: string): string {
-  const normalized = value.toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  const normalized = value
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
   return normalized || fallback;
 }
 
-function sanitizeSecretValue(value: string, placeholder: string): {
+function sanitizeSecretValue(
+  value: string,
+  placeholder: string,
+): {
   sanitizedValue: string;
   placeholder: string;
 } {
@@ -61,13 +81,15 @@ function cloneJsonObject<T>(value: T): T {
 
 function isSecretKey(key: string): boolean {
   const lower = key.toLowerCase();
-  return SECRET_ENV_KEYS.has(lower) ||
+  return (
+    SECRET_ENV_KEYS.has(lower) ||
     lower.includes('secret') ||
     lower.includes('token') ||
     lower.includes('password') ||
     lower.includes('api_key') ||
     lower.includes('apikey') ||
-    lower.includes('auth_key');
+    lower.includes('auth_key')
+  );
 }
 
 /**
@@ -116,7 +138,10 @@ function stripHeaderSecrets(headers: Record<string, string>): {
     const lower = key.toLowerCase();
     if (lower === 'authorization' || lower.includes('token') || lower.includes('auth')) {
       const placeholder = toPlaceholderName(key, 'HEADER_SECRET');
-      const { sanitizedValue, placeholder: placeholderName } = sanitizeSecretValue(value, placeholder);
+      const { sanitizedValue, placeholder: placeholderName } = sanitizeSecretValue(
+        value,
+        placeholder,
+      );
       sanitized[key] = sanitizedValue;
       placeholders.push(placeholderName);
     } else if (ENV_PLACEHOLDER_RE.test(value)) {
@@ -217,6 +242,9 @@ function stripOAuthSecrets(oauth: NonNullable<ServerConfig['oauth']>): {
 
 function stripOpenApiSecuritySecrets(
   security: NonNullable<NonNullable<ServerConfig['openapi']>['security']>,
+  // Placeholder prefix, so `security` and `specSecurity` (#1079) secrets map
+  // to distinct required env vars instead of one var filling both slots.
+  placeholderPrefix = 'OPENAPI',
 ): {
   sanitized: TemplateOpenApiSecurityConfig;
   placeholders: string[];
@@ -233,7 +261,7 @@ function stripOpenApiSecuritySecrets(
     if (security.apiKey.value) {
       const { sanitizedValue, placeholder } = sanitizeSecretValue(
         security.apiKey.value,
-        toPlaceholderName(security.apiKey.name, 'OPENAPI_API_KEY'),
+        toPlaceholderName(security.apiKey.name, `${placeholderPrefix}_API_KEY`),
       );
       sanitized.apiKey.value = sanitizedValue;
       placeholders.push(placeholder);
@@ -250,7 +278,7 @@ function stripOpenApiSecuritySecrets(
     if (security.http.credentials) {
       const { sanitizedValue, placeholder } = sanitizeSecretValue(
         security.http.credentials,
-        'OPENAPI_HTTP_CREDENTIALS',
+        `${placeholderPrefix}_HTTP_CREDENTIALS`,
       );
       sanitized.http.credentials = sanitizedValue;
       placeholders.push(placeholder);
@@ -266,7 +294,7 @@ function stripOpenApiSecuritySecrets(
     if (security.oauth2.clientSecret) {
       const { sanitizedValue, placeholder } = sanitizeSecretValue(
         security.oauth2.clientSecret,
-        'OPENAPI_OAUTH2_CLIENT_SECRET',
+        `${placeholderPrefix}_OAUTH2_CLIENT_SECRET`,
       );
       sanitized.oauth2.clientSecret = sanitizedValue;
       placeholders.push(placeholder);
@@ -275,7 +303,7 @@ function stripOpenApiSecuritySecrets(
     if (security.oauth2.token) {
       const { sanitizedValue, placeholder } = sanitizeSecretValue(
         security.oauth2.token,
-        'OPENAPI_OAUTH2_TOKEN',
+        `${placeholderPrefix}_OAUTH2_TOKEN`,
       );
       sanitized.oauth2.token = sanitizedValue;
       placeholders.push(placeholder);
@@ -292,7 +320,7 @@ function stripOpenApiSecuritySecrets(
     if (security.openIdConnect.clientSecret) {
       const { sanitizedValue, placeholder } = sanitizeSecretValue(
         security.openIdConnect.clientSecret,
-        'OPENAPI_OPENID_CLIENT_SECRET',
+        `${placeholderPrefix}_OPENID_CLIENT_SECRET`,
       );
       sanitized.openIdConnect.clientSecret = sanitizedValue;
       placeholders.push(placeholder);
@@ -300,7 +328,7 @@ function stripOpenApiSecuritySecrets(
     if (security.openIdConnect.token) {
       const { sanitizedValue, placeholder } = sanitizeSecretValue(
         security.openIdConnect.token,
-        'OPENAPI_OPENID_TOKEN',
+        `${placeholderPrefix}_OPENID_TOKEN`,
       );
       sanitized.openIdConnect.token = sanitizedValue;
       placeholders.push(placeholder);
@@ -362,7 +390,8 @@ function serverConfigToTemplate(config: ServerConfig): {
   if (config.openapi) {
     templateConfig.openapi = {};
     if (config.openapi.url) templateConfig.openapi.url = config.openapi.url;
-    if (config.openapi.schema) templateConfig.openapi.schema = cloneJsonObject(config.openapi.schema);
+    if (config.openapi.schema)
+      templateConfig.openapi.schema = cloneJsonObject(config.openapi.schema);
     if (config.openapi.version) templateConfig.openapi.version = config.openapi.version;
     if (config.openapi.passthroughHeaders) {
       templateConfig.openapi.passthroughHeaders = [...config.openapi.passthroughHeaders];
@@ -372,6 +401,14 @@ function serverConfigToTemplate(config: ServerConfig): {
       templateConfig.openapi.security = sanitized;
       envVars.push(...placeholders);
     }
+    if (config.openapi.specSecurity) {
+      const { sanitized, placeholders } = stripOpenApiSecuritySecrets(
+        config.openapi.specSecurity,
+        'OPENAPI_SPEC',
+      );
+      templateConfig.openapi.specSecurity = sanitized;
+      envVars.push(...placeholders);
+    }
   }
 
   return { templateConfig, envVars };
@@ -379,6 +416,10 @@ function serverConfigToTemplate(config: ServerConfig): {
 
 /**
  * Export configuration as a shareable template.
+ *
+ * When `options.requestingUser` is a non-admin, servers and groups are
+ * filtered with the same ownership/visibility rules as every other read path
+ * (GHSA-p589-v5cm-35qg) so a user can only export what they can already see.
  */
 export async function exportTemplate(options: TemplateExportOptions): Promise<ConfigTemplate> {
   const serverDao = getServerDao();
@@ -387,10 +428,21 @@ export async function exportTemplate(options: TemplateExportOptions): Promise<Co
   const allServers = await serverDao.findAll();
   const allGroups = await groupDao.findAll();
 
-  // Determine which groups to include
+  // Apply visibility filtering for non-admin callers. No requestingUser means
+  // a trusted system caller — keep the legacy unfiltered behavior.
+  const visibleServers: ServerConfigWithName[] =
+    options.requestingUser && !options.requestingUser.isAdmin
+      ? getDataService().filterData(allServers, options.requestingUser)
+      : allServers;
+  const visibleGroups: IGroup[] =
+    options.requestingUser && !options.requestingUser.isAdmin
+      ? getDataService().filterData(allGroups, options.requestingUser)
+      : allGroups;
+
+  // Determine which groups to include (only among groups the caller can see)
   const selectedGroups = options.groupIds?.length
-    ? allGroups.filter((g) => options.groupIds!.includes(g.id))
-    : allGroups;
+    ? visibleGroups.filter((g) => options.groupIds!.includes(g.id))
+    : visibleGroups;
 
   // Collect server names referenced by selected groups
   const referencedServerNames = new Set<string>();
@@ -420,7 +472,7 @@ export async function exportTemplate(options: TemplateExportOptions): Promise<Co
   const allEnvVars: string[] = [];
   const includedServerNames = new Set<string>();
 
-  for (const server of allServers) {
+  for (const server of visibleServers) {
     if (!referencedServerNames.has(server.name)) continue;
     if (!options.includeDisabledServers && server.enabled === false) continue;
 
@@ -451,20 +503,32 @@ export async function exportTemplate(options: TemplateExportOptions): Promise<Co
 
 /**
  * Export a single group as a template.
+ *
+ * Non-admin callers can only export groups they are allowed to see; anything
+ * else returns null (surfaced as 404 by the controller, mirroring the
+ * groupService mutation denial pattern).
  */
 export async function exportGroupTemplate(
   groupId: string,
   name?: string,
+  requestingUser?: IUser,
 ): Promise<ConfigTemplate | null> {
   const groupDao = getGroupDao();
   const group = await groupDao.findById(groupId);
   if (!group) return null;
+
+  if (requestingUser && !requestingUser.isAdmin) {
+    const visible = getDataService()
+      .filterData([group], requestingUser);
+    if (visible.length === 0) return null;
+  }
 
   return exportTemplate({
     name: name || `${group.name} Template`,
     description: `Template exported from group "${group.name}"`,
     groupIds: [groupId],
     includeDisabledServers: false,
+    requestingUser,
   });
 }
 
@@ -484,10 +548,16 @@ function validateTemplate(data: unknown): data is ConfigTemplate {
 /**
  * Import a configuration template.
  * Creates servers and groups that don't already exist.
+ *
+ * Non-admin callers cannot import privileged (stdio/command-carrying) server
+ * configs; each such server is reported as a failed detail item and skipped.
+ * No `requestingUser` means a trusted system caller — legacy unrestricted
+ * behavior, mirroring `exportTemplate`.
  */
 export async function importTemplate(
   template: unknown,
   owner?: string,
+  requestingUser?: IUser,
 ): Promise<TemplateImportResult> {
   if (!validateTemplate(template)) {
     return {
@@ -519,19 +589,43 @@ export async function importTemplate(
       continue;
     }
 
+    // Server names become part of downstream tool identifiers, so they must
+    // satisfy the same charset rule as every other create path.
+    const nameValidation = validateServerName(name);
+    if (!nameValidation.valid) {
+      details.push({
+        type: 'server',
+        name,
+        action: 'failed',
+        message: nameValidation.message || 'Invalid server name',
+      });
+      continue;
+    }
+    const serverName = nameValidation.normalized as string;
+
+    if (requestingUser && !requestingUser.isAdmin && isPrivilegedServerConfig(config)) {
+      details.push({
+        type: 'server',
+        name: serverName,
+        action: 'failed',
+        message: 'Only admins can import stdio-based server configurations',
+      });
+      continue;
+    }
+
     try {
       const serverConfig: ServerConfig = {
         ...config,
         enabled: config.enabled ?? true,
         owner: owner || 'admin',
       };
-      await addServer(name, serverConfig);
-      details.push({ type: 'server', name, action: 'created' });
+      await addServer(serverName, serverConfig);
+      details.push({ type: 'server', name: serverName, action: 'created' });
       serversCreated++;
     } catch (error) {
       details.push({
         type: 'server',
-        name,
+        name: serverName,
         action: 'failed',
         message: error instanceof Error ? error.message : 'Unknown error',
       });
@@ -545,7 +639,12 @@ export async function importTemplate(
   for (const groupDef of template.groups) {
     const existingGroup = await groupDao.findByName(groupDef.name);
     if (existingGroup) {
-      details.push({ type: 'group', name: groupDef.name, action: 'skipped', message: 'Group already exists' });
+      details.push({
+        type: 'group',
+        name: groupDef.name,
+        action: 'skipped',
+        message: 'Group already exists',
+      });
       groupsSkipped++;
       continue;
     }
@@ -561,7 +660,12 @@ export async function importTemplate(
         details.push({ type: 'group', name: groupDef.name, action: 'created' });
         groupsCreated++;
       } else {
-        details.push({ type: 'group', name: groupDef.name, action: 'failed', message: 'Failed to create group' });
+        details.push({
+          type: 'group',
+          name: groupDef.name,
+          action: 'failed',
+          message: 'Failed to create group',
+        });
       }
     } catch (error) {
       details.push({

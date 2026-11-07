@@ -9,32 +9,48 @@ MCPHub's server management system allows you to centrally configure, monitor, an
 
 ## Adding MCP Servers
 
+MCPHub supports four upstream transports. Pick the one that matches your server before filling in the dashboard form (or the JSON body).
+
+| Transport (`type`) | Description | Key fields |
+| ------------------ | ----------- | ---------- |
+| `stdio` (default) | MCPHub launches a child process and talks MCP over stdio. | `command`, `args`, `env` |
+| `sse` | Long-lived Server-Sent Events HTTP endpoint. | `url`, `headers`, `enableKeepAlive`, `keepAliveInterval` |
+| `streamable-http` | MCP Streamable HTTP transport. | `url`, `headers` |
+| `openapi` | Wraps an OpenAPI service so its operations appear as MCP tools. | `openapi.url` or `openapi.schema`, optional `headers` |
+
 ### Via Dashboard
 
-1. **Access the Dashboard**: Navigate to `http://localhost:3000` and log in
-2. **Click "Add Server"**: Located in the servers section
-3. **Fill Server Details**:
-   - **Name**: Unique identifier for the server
-   - **Command**: Executable command (e.g., `npx`, `uvx`, `python`)
-   - **Arguments**: Array of command arguments
-   - **Environment Variables**: Key-value pairs for environment setup
-   - **Working Directory**: Optional working directory for the command
+1. **Access the Dashboard**: Navigate to `http://localhost:3000` and log in.
+2. **Click "Add Server"** and choose a transport.
+3. Fill in the fields that apply to that transport. Common optional fields available on every transport: `enabled`, `owner`, `description`, `passthroughHeaders`, `oauth`, `proxy`. See [MCP Settings](/configuration/mcp-settings) for the full schema.
+
+The server card menu also offers **Duplicate**, which opens the Add Server form prefilled with the source server's configuration under the name `<name>-copy`; OAuth authorization state is not copied.
 
 ### Via Configuration File
 
-Edit your `mcp_settings.json` file:
+Edit your `mcp_settings.json` file. Examples for each transport:
 
 ```json
 {
   "mcpServers": {
-    "server-name": {
-      "command": "command-to-run",
-      "args": ["arg1", "arg2"],
-      "env": {
-        "API_KEY": "your-api-key",
-        "CONFIG_VALUE": "some-value"
-      },
-      "cwd": "/optional/working/directory"
+    "fetch": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-server-fetch"],
+      "env": { "USER_AGENT": "MCPHub/1.0" }
+    },
+    "amap": {
+      "type": "sse",
+      "url": "https://mcp.amap.com/sse?key=${AMAP_API_KEY}"
+    },
+    "weather": {
+      "type": "streamable-http",
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer ${WEATHER_TOKEN}" }
+    },
+    "stripe": {
+      "type": "openapi",
+      "openapi": { "url": "https://stripe.com/api/openapi.json" }
     }
   }
 }
@@ -47,12 +63,14 @@ Use the REST API to add servers programmatically:
 ```bash
 curl -X POST http://localhost:3000/api/servers \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -H "x-auth-token: YOUR_JWT" \
   -d '{
     "name": "fetch-server",
-    "command": "uvx",
-    "args": ["mcp-server-fetch"],
-    "env": {}
+    "config": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-server-fetch"]
+    }
   }'
 ```
 
@@ -229,6 +247,27 @@ curl -X POST http://localhost:3000/api/servers \
 
   </Accordion>
 </AccordionGroup>
+
+## Copying a client configuration
+
+Both server cards and group cards offer a copy action that opens a client preset dialog, so you can paste a ready-made configuration into your favorite MCP client:
+
+- **Copy MCP config** (group card menu): generates the configuration for the group's aggregated endpoint (`<baseUrl>/mcp/<group>`), which multiplexes every server in the group behind one URL.
+- **Copy** (server card menu): wraps that server's own stored configuration (its `command`/`args`/`env` for stdio servers, or its `url`/`headers` for HTTP/SSE servers) in the shape the selected client expects.
+
+Servers backed by the `openapi` transport have no client-side transport of their own, so the dialog shows a "no transport" notice instead of presets; this is expected, not an error. Servers using the `sse` transport keep their `"type": "sse"` marker in the generated JSON (and the Claude Code command switches to `--transport sse`) so clients do not misdial them as streamable HTTP.
+
+The dialog provides presets for the following clients: Generic (mcpServers), Generic HTTP, Claude Code, Cursor, VS Code / Copilot, Codex, OpenCode, Windsurf, Cherry Studio, CodeBuddy Code, Qoder, TRAE, ZCode, and WorkBuddy.
+
+The **Claude Code** tab additionally offers a one-liner CLI command:
+
+```bash
+claude mcp add --transport http <name> <url> --header 'Authorization: Bearer <token>'
+```
+
+Values containing characters outside a safe CLI set are wrapped in single quotes (as the header above is), so the command can be pasted verbatim into a POSIX shell; on Windows shells that do not parse single quotes, re-quote the affected values.
+
+A few clients use their own key names in the generated configuration: Codex uses `http_headers` (there is no `headers` key), VS Code uses `servers` plus a `type` field, and Cherry Studio uses `baseUrl` with a `type` of `streamableHttp` — or `sse` when the upstream is an SSE endpoint.
 
 ## Server Lifecycle Management
 

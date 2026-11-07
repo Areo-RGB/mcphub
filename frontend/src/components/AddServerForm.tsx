@@ -1,26 +1,64 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import ServerForm from './ServerForm'
 import { apiPost } from '../utils/fetchInterceptor'
 import { detectVariables } from '../utils/variableDetection'
+import { buildDuplicateSource, carryOverCapabilityOverrides } from '../utils/serverDuplicate'
+import { useSettingsData } from '../hooks/useSettingsData'
+import { Server } from '../types'
 
 interface AddServerFormProps {
   onAdd: () => void
+  /**
+   * Source server for the card's Duplicate action (#1187). Setting it opens the
+   * add modal pre-filled from that server and the copy is created through the
+   * normal `POST /servers` path; clearing it closes the modal again.
+   */
+  duplicateSource?: Server | null
+  onDuplicateCancel?: () => void
 }
 
-const AddServerForm = ({ onAdd }: AddServerFormProps) => {
+const AddServerForm = ({
+  onAdd,
+  duplicateSource = null,
+  onDuplicateCancel,
+}: AddServerFormProps) => {
   const { t } = useTranslation()
-  const [modalVisible, setModalVisible] = useState(false)
+  const { nameSeparator } = useSettingsData()
+  const [addModalVisible, setAddModalVisible] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [confirmationVisible, setConfirmationVisible] = useState(false)
   const [pendingPayload, setPendingPayload] = useState<any>(null)
   const [detectedVariables, setDetectedVariables] = useState<string[]>([])
 
-  const toggleModal = () => {
-    setModalVisible(!modalVisible)
+  const duplicatePrefill = useMemo(
+    () => (duplicateSource ? buildDuplicateSource(duplicateSource) : null),
+    [duplicateSource],
+  )
+  const modalVisible = addModalVisible || duplicateSource !== null
+
+  const resetModalState = () => {
     setError(null) // Clear any previous errors when toggling modal
     setConfirmationVisible(false) // Close confirmation dialog
     setPendingPayload(null) // Clear pending payload
+  }
+
+  const closeModal = () => {
+    setAddModalVisible(false)
+    resetModalState()
+    if (duplicateSource) {
+      onDuplicateCancel?.()
+    }
+  }
+
+  const toggleModal = () => {
+    if (modalVisible) {
+      closeModal()
+      return
+    }
+
+    setAddModalVisible(true)
+    resetModalState()
   }
 
   const handleConfirmSubmit = async () => {
@@ -46,7 +84,7 @@ const AddServerForm = ({ onAdd }: AddServerFormProps) => {
         return
       }
 
-      setModalVisible(false)
+      closeModal()
       onAdd()
     } catch (err) {
       console.error('Error adding server:', err)
@@ -67,17 +105,23 @@ const AddServerForm = ({ onAdd }: AddServerFormProps) => {
 
   const handleSubmit = async (payload: any) => {
     try {
+      // The create payload is rebuilt from form fields, so a duplicate has to
+      // get the source's capability overrides re-attached (#1187).
+      const nextPayload = duplicateSource
+        ? carryOverCapabilityOverrides(payload, duplicateSource, { nameSeparator })
+        : payload
+
       // Check for variables in the payload
-      const variables = detectVariables(payload)
+      const variables = detectVariables(nextPayload)
 
       if (variables.length > 0) {
         // Show confirmation dialog
         setDetectedVariables(variables)
-        setPendingPayload(payload)
+        setPendingPayload(nextPayload)
         setConfirmationVisible(true)
       } else {
         // Submit directly if no variables found
-        await submitServer(payload)
+        await submitServer(nextPayload)
       }
     } catch (err) {
       console.error('Error processing server submission:', err)
@@ -89,9 +133,9 @@ const AddServerForm = ({ onAdd }: AddServerFormProps) => {
     <div>
       <button
         onClick={toggleModal}
-        className="w-full bg-blue-100 text-blue-800 rounded hover:bg-blue-200 py-2 px-4 flex items-center justify-center btn-primary"
+        className="hub-btn primary"
       >
-        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-2" viewBox="0 0 20 20" fill="currentColor">
+        <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor">
           <path fillRule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clipRule="evenodd" />
         </svg>
         {t('server.add')}
@@ -99,10 +143,26 @@ const AddServerForm = ({ onAdd }: AddServerFormProps) => {
 
       {modalVisible && (
         <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+          {/* B1: keyed on the source name so switching the duplicate source
+              forces ServerForm to remount. ServerForm seeds its internal state
+              from `initialData` only on mount, so the key guarantees the form
+              re-initializes from the current source in every case. This is
+              defence in depth rather than a reachable defect path: the modal
+              overlay blocks further clicks while it is open, and the
+              ServersPage request-id guard already drops superseded duplicate
+              responses before they can swap the source mid-session. */}
           <ServerForm
+            key={duplicateSource?.name ?? 'add'}
             onSubmit={handleSubmit}
-            onCancel={toggleModal}
-            modalTitle={t('server.addServer')}
+            onCancel={closeModal}
+            initialData={duplicatePrefill}
+            mode="create"
+            shareCandidatesFrom={duplicateSource?.name}
+            modalTitle={
+              duplicateSource
+                ? t('server.duplicateTitle', { serverName: duplicateSource.name })
+                : t('server.addServer')
+            }
             formError={error}
           />
         </div>
@@ -110,7 +170,7 @@ const AddServerForm = ({ onAdd }: AddServerFormProps) => {
 
       {confirmationVisible && (
         <div className="fixed inset-0 bg-black/50 z-[60] flex items-center justify-center p-4">
-          <div className="bg-white rounded-lg p-6 w-full max-w-md">
+          <div className="hub-card p-6 w-full max-w-md">
             <h3 className="text-lg font-semibold text-gray-900 mb-4">
               {t('server.confirmVariables')}
             </h3>
@@ -147,13 +207,13 @@ const AddServerForm = ({ onAdd }: AddServerFormProps) => {
                   setConfirmationVisible(false)
                   setPendingPayload(null)
                 }}
-                className="px-4 py-2 text-gray-600 border border-gray-300 rounded hover:bg-gray-50 btn-secondary"
+                className="hub-btn"
               >
                 {t('common.cancel')}
               </button>
               <button
                 onClick={handleConfirmSubmit}
-                className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 btn-primary"
+                className="hub-btn primary"
               >
                 {t('server.confirmAndAdd')}
               </button>

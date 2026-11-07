@@ -4,6 +4,9 @@ import path from 'path';
 import fs from 'fs';
 import AdmZip from 'adm-zip';
 import { ApiResponse } from '../types/index.js';
+import { logger } from '../utils/logger.js';
+import { requireAdmin } from '../utils/requireAdmin.js';
+import { validateServerName } from '../utils/serverNameValidation.js';
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
@@ -16,8 +19,12 @@ const storage = multer.diskStorage({
   },
   filename: (_req, file, cb) => {
     const timestamp = Date.now();
-    const originalName = path.parse(file.originalname).name;
-    cb(null, `${originalName}-${timestamp}.mcpb`);
+    // Sanitize the original name so the stored path cannot escape the upload directory
+    const safeOriginalName = path.parse(path.basename(file.originalname)).name.replace(
+      /[^A-Za-z0-9._-]/g,
+      '_',
+    );
+    cb(null, `${safeOriginalName}-${timestamp}.mcpb`);
   },
 });
 
@@ -37,10 +44,37 @@ const upload = multer({
 
 export const uploadMiddleware = upload.single('mcpbFile');
 
+const MCPB_UPLOAD_DIR = path.join('data', 'uploads', 'mcpb');
+
+const getMcpbUploadDir = (): string => path.join(process.cwd(), MCPB_UPLOAD_DIR);
+
+const validateMcpbServerName = (serverName: unknown): string => {
+  // Reuse the shared server-name rule (charset + `..`/path-separator safety)
+  // while keeping the MCPB-specific error wording.
+  const validation = validateServerName(serverName);
+  if (!validation.valid) {
+    throw new Error('Invalid manifest: name contains unsafe characters');
+  }
+
+  return validation.normalized as string;
+};
+
+const resolveMcpbServerExtractDir = (baseDir: string, serverName: string): string => {
+  const resolvedBaseDir = path.resolve(baseDir);
+  const resolvedTargetDir = path.resolve(resolvedBaseDir, `server-${serverName}`);
+  const relativeTargetPath = path.relative(resolvedBaseDir, resolvedTargetDir);
+
+  if (relativeTargetPath.startsWith('..') || path.isAbsolute(relativeTargetPath)) {
+    throw new Error('Invalid manifest: name resolves outside upload directory');
+  }
+
+  return resolvedTargetDir;
+};
+
 // Clean up old MCPB server files when installing a new version
 const cleanupOldMcpbServer = (serverName: string): void => {
   try {
-    const uploadDir = path.join(process.cwd(), 'data/uploads/mcpb');
+    const uploadDir = getMcpbUploadDir();
     const serverPattern = `server-${serverName}`;
 
     if (fs.existsSync(uploadDir)) {
@@ -50,19 +84,26 @@ const cleanupOldMcpbServer = (serverName: string): void => {
           const filePath = path.join(uploadDir, file);
           if (fs.statSync(filePath).isDirectory()) {
             fs.rmSync(filePath, { recursive: true, force: true });
-            console.log(`Cleaned up old MCPB server directory: ${filePath}`);
+            logger.log(`Cleaned up old MCPB server directory: ${filePath}`);
           }
         }
       });
     }
   } catch (error) {
-    console.warn('Failed to cleanup old MCPB server files:', error);
+    logger.warn('Failed to cleanup old MCPB server files:', error);
     // Don't fail the installation if cleanup fails
   }
 };
 
 export const uploadMcpbFile = async (req: Request, res: Response): Promise<void> => {
   try {
+    // Defense in depth: the route already gates this endpoint behind
+    // requireAdminMiddleware (before multer stages the body). Re-check here so
+    // the handler stays safe even if it is invoked through another path, since
+    // it replaces executable code at a deterministic path that existing stdio
+    // server configurations point into (GHSA-xf2m-3c3x-53vp).
+    if (!(await requireAdmin(req, res))) return;
+
     if (!req.file) {
       res.status(400).json({
         success: false,
@@ -71,7 +112,15 @@ export const uploadMcpbFile = async (req: Request, res: Response): Promise<void>
       return;
     }
 
-    const mcpbFilePath = req.file.path;
+    const mcpbFilePath = req.file?.path;
+    const uploadRoot = `${path.resolve(getMcpbUploadDir())}${path.sep}`;
+    if (!mcpbFilePath || !path.resolve(mcpbFilePath).startsWith(uploadRoot)) {
+      res.status(400).json({
+        success: false,
+        message: mcpbFilePath ? 'Invalid MCPB file location' : 'No MCPB file uploaded',
+      });
+      return;
+    }
     const timestamp = Date.now();
     const tempExtractDir = path.join(path.dirname(mcpbFilePath), `temp-extracted-${timestamp}`);
 
@@ -103,18 +152,23 @@ export const uploadMcpbFile = async (req: Request, res: Response): Promise<void>
         throw new Error('Invalid manifest: missing server configuration');
       }
 
+      const safeServerName = validateMcpbServerName(manifest.name);
+
       // Use server name as the final extract directory for automatic version management
-      const finalExtractDir = path.join(path.dirname(mcpbFilePath), `server-${manifest.name}`);
+      const finalExtractDir = resolveMcpbServerExtractDir(
+        path.dirname(mcpbFilePath),
+        safeServerName,
+      );
 
       // Clean up any existing version of this server
-      cleanupOldMcpbServer(manifest.name);
+      cleanupOldMcpbServer(safeServerName);
       if (!fs.existsSync(finalExtractDir)) {
         fs.mkdirSync(finalExtractDir, { recursive: true });
       }
 
       // Move the temporary directory to the final location
       fs.renameSync(tempExtractDir, finalExtractDir);
-      console.log(`MCPB server extracted to: ${finalExtractDir}`);
+      logger.log(`MCPB server extracted to: ${finalExtractDir}`);
 
       // Clean up the uploaded MCPB file
       fs.unlinkSync(mcpbFilePath);
@@ -139,7 +193,7 @@ export const uploadMcpbFile = async (req: Request, res: Response): Promise<void>
       throw extractError;
     }
   } catch (error) {
-    console.error('MCPB upload error:', error);
+    logger.error('MCPB upload error:', error);
 
     let message = 'Failed to process MCPB file';
     if (error instanceof Error) {

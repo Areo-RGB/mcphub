@@ -2,46 +2,18 @@ import { Request, Response } from 'express';
 import crypto from 'crypto';
 import {
   createOAuthClient,
+  createRegistrationToken,
   findOAuthClientById,
   updateOAuthClient,
   deleteOAuthClient,
+  verifyRegistrationToken,
+  deleteRegistrationToken,
 } from '../models/OAuth.js';
 import { IOAuthClient } from '../types/index.js';
-import { loadSettings } from '../config/index.js';
-
-// Store registration access tokens (in production, use database)
-const registrationTokens = new Map<string, { clientId: string; createdAt: Date }>();
-
-/**
- * Generate registration access token
- */
-const generateRegistrationToken = (clientId: string): string => {
-  const token = crypto.randomBytes(32).toString('hex');
-  registrationTokens.set(token, {
-    clientId,
-    createdAt: new Date(),
-  });
-  return token;
-};
-
-/**
- * Verify registration access token
- */
-const verifyRegistrationToken = (token: string): string | null => {
-  const data = registrationTokens.get(token);
-  if (!data) {
-    return null;
-  }
-
-  // Token expires after 30 days
-  const expiresAt = new Date(data.createdAt.getTime() + 30 * 24 * 60 * 60 * 1000);
-  if (new Date() > expiresAt) {
-    registrationTokens.delete(token);
-    return null;
-  }
-
-  return data.clientId;
-};
+import { getSystemConfigDao } from '../dao/DaoFactory.js';
+import { auth } from '../middlewares/auth.js';
+import { resolveInstallBaseUrl } from '../utils/installBaseUrl.js';
+import { logger } from '../utils/logger.js';
 
 /**
  * POST /oauth/register
@@ -50,8 +22,8 @@ const verifyRegistrationToken = (token: string): string | null => {
  */
 export const registerClient = async (req: Request, res: Response): Promise<void> => {
   try {
-    const settings = loadSettings();
-    const oauthConfig = settings.systemConfig?.oauthServer;
+    const systemConfig = await getSystemConfigDao().get();
+    const oauthConfig = systemConfig?.oauthServer;
 
     // Check if dynamic registration is enabled
     if (!oauthConfig?.dynamicRegistration?.enabled) {
@@ -60,6 +32,22 @@ export const registerClient = async (req: Request, res: Response): Promise<void>
         error_description: 'Dynamic client registration is not enabled',
       });
       return;
+    }
+
+    // RFC 7591 §3.1 + GHSA-wwgw/3m7m follow-up: when the operator marks
+    // dynamic registration as requiring authentication, only requests carrying
+    // a recognized credential (dashboard JWT, bearer key, OAuth token or
+    // Better Auth session) may register clients. auth() always settles after
+    // either attaching req.user or sending an error response itself.
+    if (oauthConfig.dynamicRegistration.requiresAuthentication) {
+      try {
+        await auth(req, res, () => {});
+      } catch {
+        // Treated as unauthenticated below.
+      }
+      if (!(req as any).user || res.headersSent) {
+        return;
+      }
     }
 
     // Validate required fields
@@ -154,9 +142,8 @@ export const registerClient = async (req: Request, res: Response): Promise<void>
     }
 
     // Generate registration access token
-    const registrationAccessToken = generateRegistrationToken(clientId);
-    const baseUrl =
-      settings.systemConfig?.install?.baseUrl || `${req.protocol}://${req.get('host')}`;
+    const registrationAccessToken = createRegistrationToken(clientId);
+    const baseUrl = resolveInstallBaseUrl(systemConfig, `${req.protocol}://${req.get('host')}`);
     const registrationClientUri = `${baseUrl}/oauth/register/${clientId}`;
 
     // Create OAuth client
@@ -168,6 +155,9 @@ export const registerClient = async (req: Request, res: Response): Promise<void>
       grants: clientGrantTypes,
       scopes: requestedScopes,
       owner: 'dynamic-registration',
+      // Persist the registration timestamp (RFC 7591 client_id_issued_at) so
+      // idle clients can be reaped by cleanupExpired() based on age.
+      clientIdIssuedAt: Math.floor(Date.now() / 1000),
       // Store additional metadata
       metadata: {
         application_type: application_type || 'web',
@@ -217,7 +207,7 @@ export const registerClient = async (req: Request, res: Response): Promise<void>
 
     res.status(201).json(response);
   } catch (error) {
-    console.error('Dynamic client registration error:', error);
+    logger.error('Dynamic client registration error:', error);
 
     if (error instanceof Error && error.message.includes('already exists')) {
       res.status(400).json({
@@ -298,7 +288,7 @@ export const getClientConfiguration = async (req: Request, res: Response): Promi
 
     res.json(response);
   } catch (error) {
-    console.error('Get client configuration error:', error);
+    logger.error('Get client configuration error:', error);
     res.status(500).json({
       error: 'server_error',
       error_description: 'Failed to retrieve client configuration',
@@ -356,8 +346,8 @@ export const updateClientConfiguration = async (req: Request, res: Response): Pr
       tos_uri,
     } = req.body;
 
-    const settings = loadSettings();
-    const oauthConfig = settings.systemConfig?.oauthServer;
+    const systemConfig = await getSystemConfigDao().get();
+    const oauthConfig = systemConfig?.oauthServer;
 
     // Validate redirect URIs if provided
     if (redirect_uris) {
@@ -482,7 +472,7 @@ export const updateClientConfiguration = async (req: Request, res: Response): Pr
 
     res.json(response);
   } catch (error) {
-    console.error('Update client configuration error:', error);
+    logger.error('Update client configuration error:', error);
     res.status(500).json({
       error: 'server_error',
       error_description: 'Failed to update client configuration',
@@ -530,11 +520,11 @@ export const deleteClientRegistration = async (req: Request, res: Response): Pro
     }
 
     // Clean up registration token
-    registrationTokens.delete(token);
+    deleteRegistrationToken(token);
 
     res.status(204).send();
   } catch (error) {
-    console.error('Delete client registration error:', error);
+    logger.error('Delete client registration error:', error);
     res.status(500).json({
       error: 'server_error',
       error_description: 'Failed to delete client registration',

@@ -10,7 +10,12 @@
  */
 
 import * as client from 'openid-client';
+import { getSystemConfigDao, getUserDao } from '../dao/index.js';
 import { ServerConfig } from '../types/index.js';
+import { resolveInstallBaseUrl } from '../utils/installBaseUrl.js';
+import { resolvePreferredRedirectUris } from '../utils/oauthRedirectUri.js';
+import { logger } from '../utils/logger.js';
+import { createRedirectValidatingFetch, type FetchLike } from '../utils/ssrf.js';
 import {
   mutateOAuthSettings,
   persistClientCredentials,
@@ -29,6 +34,19 @@ interface RegisteredClientInfo {
 
 // Cache for registered clients to avoid re-registering on every restart
 const registeredClients = new Map<string, RegisteredClientInfo>();
+const pendingRegistrations = new Map<string, Promise<RegisteredClientInfo>>();
+
+export const createOAuthFetch = async (serverConfig?: ServerConfig): Promise<FetchLike> => {
+  const ownerUser = serverConfig?.owner
+    ? await getUserDao().findByUsername(serverConfig.owner)
+    : undefined;
+  return createRedirectValidatingFetch(fetch, ownerUser?.isAdmin === true);
+};
+
+const toOpenIdClientFetch =
+  (fetchFn: FetchLike): client.CustomFetch =>
+  (url, options) =>
+    fetchFn(url, options as unknown as RequestInit);
 
 export const removeRegisteredClient = (serverName: string): void => {
   registeredClients.delete(serverName);
@@ -63,15 +81,17 @@ export const parseWWWAuthenticateHeader = (header: string): string | null => {
  */
 export const fetchProtectedResourceMetadata = async (
   resourceMetadataUrl: string,
+  fetchFn?: FetchLike,
 ): Promise<{
   authorization_servers: string[];
   resource?: string;
   [key: string]: any;
 }> => {
   try {
-    console.log('Fetching protected resource metadata', { resourceMetadataUrl });
+    logger.log('Fetching protected resource metadata', { resourceMetadataUrl });
 
-    const response = await fetch(resourceMetadataUrl, {
+    const safeFetch = fetchFn ?? (await createOAuthFetch());
+    const response = await safeFetch(resourceMetadataUrl, {
       method: 'GET',
       headers: {
         Accept: 'application/json',
@@ -90,12 +110,12 @@ export const fetchProtectedResourceMetadata = async (
       throw new Error('Invalid resource metadata: missing authorization_servers field');
     }
 
-    console.log('Found authorization servers in protected resource metadata', {
+    logger.log('Found authorization servers in protected resource metadata', {
       authorizationServerCount: metadata.authorization_servers.length,
     });
     return metadata;
   } catch (error) {
-    console.warn('Failed to fetch protected resource metadata', {
+    logger.warn('Failed to fetch protected resource metadata', {
       resourceMetadataUrl,
       error,
     });
@@ -109,7 +129,10 @@ export const fetchProtectedResourceMetadata = async (
  * @param serverUrl - The MCP server URL
  * @returns Array of supported scopes or undefined if not available
  */
-export const fetchScopesFromServer = async (serverUrl: string): Promise<string[] | undefined> => {
+export const fetchScopesFromServer = async (
+  serverUrl: string,
+  fetchFn?: FetchLike,
+): Promise<string[] | undefined> => {
   try {
     // Construct the well-known protected resource metadata URL
     // Format: https://example.com/.well-known/oauth-protected-resource/path/to/resource
@@ -117,14 +140,14 @@ export const fetchScopesFromServer = async (serverUrl: string): Promise<string[]
     const resourcePath = url.pathname + url.search;
     const wellKnownUrl = `${url.origin}/.well-known/oauth-protected-resource${resourcePath}`;
 
-    console.log('Attempting to fetch OAuth scopes from protected resource metadata', {
+    logger.log('Attempting to fetch OAuth scopes from protected resource metadata', {
       wellKnownUrl,
     });
 
-    const metadata = await fetchProtectedResourceMetadata(wellKnownUrl);
+    const metadata = await fetchProtectedResourceMetadata(wellKnownUrl, fetchFn);
 
     if (metadata.scopes_supported && Array.isArray(metadata.scopes_supported)) {
-      console.log('Fetched OAuth scopes from server', {
+      logger.log('Fetched OAuth scopes from server', {
         scopes: metadata.scopes_supported,
       });
       return metadata.scopes_supported as string[];
@@ -132,7 +155,7 @@ export const fetchScopesFromServer = async (serverUrl: string): Promise<string[]
 
     return undefined;
   } catch (error) {
-    console.log('Could not fetch OAuth scopes from server; continuing without discovery', {
+    logger.log('Could not fetch OAuth scopes from server; continuing without discovery', {
       error,
     });
     return undefined;
@@ -156,7 +179,7 @@ export const autoDetectOAuthConfig = async (
     const resourceMetadataUrl = parseWWWAuthenticateHeader(wwwAuthenticateHeader);
 
     if (!resourceMetadataUrl) {
-      console.log('No resource metadata URL found in WWW-Authenticate header');
+      logger.log('No resource metadata URL found in WWW-Authenticate header');
       return null;
     }
 
@@ -176,11 +199,11 @@ export const autoDetectOAuthConfig = async (
     // Step 5: Extract supported scopes from resource metadata
     const scopes = resourceMetadata.scopes_supported as string[] | undefined;
 
-    console.log('Auto-detected OAuth configuration', { issuer, resource, scopes });
+    logger.log('Auto-detected OAuth configuration', { issuer, resource, scopes });
 
     return { issuer, resource, scopes };
   } catch (error) {
-    console.error('Failed to auto-detect OAuth configuration', { error, serverUrl });
+    logger.error('Failed to auto-detect OAuth configuration', { error, serverUrl });
     return null;
   }
 };
@@ -194,16 +217,19 @@ export const discoverIssuer = async (
   clientSecret?: string,
 ): Promise<client.Configuration> => {
   try {
-    console.log('Discovering OAuth issuer', { issuerUrl });
+    logger.log('Discovering OAuth issuer', { issuerUrl });
     const server = new URL(issuerUrl);
+    const safeFetch = await createOAuthFetch();
 
     const clientAuth = clientSecret ? client.ClientSecretPost(clientSecret) : client.None();
 
-    const config = await client.discovery(server, clientId, undefined, clientAuth);
-    console.log('Successfully discovered OAuth issuer', { issuerUrl });
+    const config = await client.discovery(server, clientId, undefined, clientAuth, {
+      [client.customFetch]: toOpenIdClientFetch(safeFetch),
+    });
+    logger.log('Successfully discovered OAuth issuer', { issuerUrl });
     return config;
   } catch (error) {
-    console.error('Failed to discover OAuth issuer', { issuerUrl, error });
+    logger.error('Failed to discover OAuth issuer', { issuerUrl, error });
     throw new Error(
       `OAuth issuer discovery failed: ${error instanceof Error ? error.message : String(error)}`,
     );
@@ -223,10 +249,35 @@ export const registerClient = async (
   // Check if we already have a registered client for this server
   const cached = registeredClients.get(serverName);
   if (cached && (!cached.expiresAt || cached.expiresAt > Date.now())) {
-    console.log('Using cached OAuth client', { serverName });
+    logger.log('Using cached OAuth client', { serverName });
     return cached;
   }
 
+  const pending = pendingRegistrations.get(serverName);
+  if (pending) {
+    return pending;
+  }
+
+  const registration = registerAndPersistClient(
+    serverName,
+    serverConfig,
+    autoDetectedIssuer,
+    autoDetectedScopes,
+  );
+  pendingRegistrations.set(serverName, registration);
+  try {
+    return await registration;
+  } finally {
+    pendingRegistrations.delete(serverName);
+  }
+};
+
+const registerAndPersistClient = async (
+  serverName: string,
+  serverConfig: ServerConfig,
+  autoDetectedIssuer?: string,
+  autoDetectedScopes?: string[],
+): Promise<RegisteredClientInfo> => {
   const dynamicConfig = serverConfig.oauth?.dynamicRegistration;
 
   try {
@@ -250,6 +301,11 @@ export const registerClient = async (
 
     // Step 2: Prepare client metadata for registration
     const metadata = dynamicConfig?.metadata || {};
+    const systemConfig = await getSystemConfigDao().get();
+    const redirectUris = resolvePreferredRedirectUris(
+      serverConfig,
+      resolveInstallBaseUrl(systemConfig),
+    );
 
     // Determine scopes: priority is metadata.scope > autoDetectedScopes > configured scopes > 'openid'
     let scopeValue: string;
@@ -265,7 +321,7 @@ export const registerClient = async (
 
     const clientMetadata: Partial<client.ClientMetadata> = {
       client_name: metadata.client_name || `MCPHub - ${serverName}`,
-      redirect_uris: metadata.redirect_uris || ['http://localhost:3000/oauth/callback'],
+      redirect_uris: redirectUris,
       grant_types: metadata.grant_types || ['authorization_code', 'refresh_token'],
       response_types: metadata.response_types || ['code'],
       token_endpoint_auth_method: metadata.token_endpoint_auth_method || 'client_secret_post',
@@ -273,7 +329,7 @@ export const registerClient = async (
       ...metadata, // Include any additional custom metadata
     };
 
-    console.log('Registering OAuth client', {
+    logger.log('Registering OAuth client', {
       serverName,
       serverUrl: serverUrl.toString(),
     });
@@ -282,14 +338,17 @@ export const registerClient = async (
     const clientAuth = dynamicConfig?.initialAccessToken
       ? client.ClientSecretPost(dynamicConfig.initialAccessToken)
       : client.None();
+    const safeFetch = await createOAuthFetch(serverConfig);
 
-    const config = await client.dynamicClientRegistration(serverUrl, clientMetadata, clientAuth);
+    const config = await client.dynamicClientRegistration(serverUrl, clientMetadata, clientAuth, {
+      [client.customFetch]: toOpenIdClientFetch(safeFetch),
+    });
 
-    console.log('Successfully registered OAuth client', { serverName });
+    logger.log('Successfully registered OAuth client', { serverName });
 
     // Extract client ID from the configuration
     const clientId = (config as any).client_id || (config as any).clientId;
-    console.log('Registered OAuth client identifier', { serverName, clientId });
+    logger.log('Registered OAuth client identifier', { serverName, clientId });
 
     // Step 4: Store registered client information
     const clientInfo: RegisteredClientInfo = {
@@ -304,9 +363,6 @@ export const registerClient = async (
       metadata: config,
     };
 
-    // Cache the registered client
-    registeredClients.set(serverName, clientInfo);
-
     // Persist the client credentials and scopes to configuration
     const persistedConfig = await persistClientCredentials(serverName, {
       clientId,
@@ -314,18 +370,22 @@ export const registerClient = async (
       scopes: autoDetectedScopes,
       authorizationEndpoint: clientInfo.config.serverMetadata().authorization_endpoint,
       tokenEndpoint: clientInfo.config.serverMetadata().token_endpoint,
+      revocationEndpoint: clientInfo.config.serverMetadata().revocation_endpoint,
     });
 
-    if (persistedConfig) {
-      serverConfig.oauth = {
-        ...(serverConfig.oauth || {}),
-        ...persistedConfig.oauth,
-      };
+    if (!persistedConfig) {
+      throw new Error(`Failed to persist OAuth client credentials for server ${serverName}`);
     }
+
+    serverConfig.oauth = {
+      ...(serverConfig.oauth || {}),
+      ...persistedConfig.oauth,
+    };
+    registeredClients.set(serverName, clientInfo);
 
     return clientInfo;
   } catch (error) {
-    console.error('Failed to register OAuth client', { serverName, error });
+    logger.error('Failed to register OAuth client', { serverName, error });
     throw error;
   }
 };
@@ -362,7 +422,7 @@ export const getAuthorizationUrl = async (
     const authUrl = client.buildAuthorizationUrl(clientInfo.config, params);
     return authUrl.toString();
   } catch (error) {
-    console.error('Failed to generate OAuth authorization URL', { serverName, error });
+    logger.error('Failed to generate OAuth authorization URL', { serverName, error });
     throw error;
   }
 };
@@ -378,7 +438,7 @@ export const exchangeCodeForToken = async (
   codeVerifier: string,
 ): Promise<{ accessToken: string; refreshToken?: string; expiresIn?: number }> => {
   try {
-    console.log('Exchanging authorization code for access token', { serverName });
+    logger.log('Exchanging authorization code for access token', { serverName });
 
     // Prepare token endpoint parameters
     const tokenParams: Record<string, string> = {
@@ -397,7 +457,7 @@ export const exchangeCodeForToken = async (
       tokenParams,
     );
 
-    console.log('Successfully obtained OAuth access token', { serverName });
+    logger.log('Successfully obtained OAuth access token', { serverName });
 
     await persistTokens(serverName, {
       accessToken: tokens.access_token,
@@ -410,7 +470,7 @@ export const exchangeCodeForToken = async (
       expiresIn: tokens.expires_in,
     };
   } catch (error) {
-    console.error('Failed to exchange authorization code for token', { serverName, error });
+    logger.error('Failed to exchange authorization code for token', { serverName, error });
     throw error;
   }
 };
@@ -425,7 +485,7 @@ export const refreshAccessToken = async (
   refreshToken: string,
 ): Promise<{ accessToken: string; refreshToken?: string; expiresIn?: number }> => {
   try {
-    console.log('Refreshing OAuth access token', { serverName });
+    logger.log('Refreshing OAuth access token', { serverName });
 
     // Prepare refresh token parameters
     const params: Record<string, string> = {};
@@ -437,7 +497,7 @@ export const refreshAccessToken = async (
 
     const tokens = await client.refreshTokenGrant(clientInfo.config, refreshToken, params);
 
-    console.log('Successfully refreshed OAuth access token', { serverName });
+    logger.log('Successfully refreshed OAuth access token', { serverName });
 
     await persistTokens(serverName, {
       accessToken: tokens.access_token,
@@ -450,7 +510,7 @@ export const refreshAccessToken = async (
       expiresIn: tokens.expires_in,
     };
   } catch (error) {
-    console.error('Failed to refresh OAuth access token', { serverName, error });
+    logger.error('Failed to refresh OAuth access token', { serverName, error });
     throw error;
   }
 };
@@ -513,7 +573,7 @@ export const initializeOAuthForServer = async (
       );
       return clientInfo;
     } catch (error) {
-      console.error('Failed to initialize OAuth for server', { serverName, error });
+      logger.error('Failed to initialize OAuth for server', { serverName, error });
       // If auto-detection failed, don't throw - allow fallback to static config
       if (!autoDetectedIssuer) {
         throw error;
@@ -523,10 +583,12 @@ export const initializeOAuthForServer = async (
 
   // Static client configuration - create Configuration from static values
   if (serverConfig.oauth.clientId) {
+    const safeFetch = await createOAuthFetch(serverConfig);
+
     // Try to fetch and store scopes if not already configured
     if (!serverConfig.oauth.scopes && serverConfig.url) {
       try {
-        const fetchedScopes = await fetchScopesFromServer(serverConfig.url);
+        const fetchedScopes = await fetchScopesFromServer(serverConfig.url, safeFetch);
         if (fetchedScopes && fetchedScopes.length > 0) {
           await mutateOAuthSettings(serverName, ({ oauth }) => {
             oauth.scopes = fetchedScopes;
@@ -536,10 +598,10 @@ export const initializeOAuthForServer = async (
             serverConfig.oauth = {};
           }
           serverConfig.oauth.scopes = fetchedScopes;
-          console.log('Stored fetched OAuth scopes', { serverName, scopes: fetchedScopes });
+          logger.log('Stored fetched OAuth scopes', { serverName, scopes: fetchedScopes });
         }
       } catch (error) {
-        console.log('Failed to fetch OAuth scopes; using defaults', { serverName, error });
+        logger.log('Failed to fetch OAuth scopes; using defaults', { serverName, error });
       }
     }
 
@@ -553,7 +615,7 @@ export const initializeOAuthForServer = async (
       const tokenUrl = new URL(serverConfig.oauth.tokenEndpoint!);
       serverUrl = new URL(`${tokenUrl.protocol}//${tokenUrl.host}`);
     } else {
-      console.warn('Static OAuth config is missing endpoints', { serverName });
+      logger.warn('Static OAuth config is missing endpoints', { serverName });
       return null;
     }
 
@@ -568,6 +630,9 @@ export const initializeOAuthForServer = async (
         serverConfig.oauth.clientId!,
         undefined,
         clientAuth,
+        {
+          [client.customFetch]: toOpenIdClientFetch(safeFetch),
+        },
       );
 
       const clientInfo: RegisteredClientInfo = {
@@ -580,7 +645,7 @@ export const initializeOAuthForServer = async (
       registeredClients.set(serverName, clientInfo);
       return clientInfo;
     } catch (error) {
-      console.error('Failed to discover OAuth server for static configuration', {
+      logger.error('Failed to discover OAuth server for static configuration', {
         serverName,
         error,
       });

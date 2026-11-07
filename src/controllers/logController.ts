@@ -1,31 +1,39 @@
 // filepath: /Users/sunmeng/code/github/mcphub/src/controllers/logController.ts
 import { Request, Response } from 'express';
 import logService from '../services/logService.js';
+import { logger } from '../utils/logger.js';
+import { requireAdmin } from '../utils/requireAdmin.js';
 
 // Get all logs
-export const getAllLogs = (req: Request, res: Response): void => {
+export const getAllLogs = async (req: Request, res: Response): Promise<void> => {
+  if (!(await requireAdmin(req, res))) return;
+
   try {
     const logs = logService.getLogs();
     res.json({ success: true, data: logs });
   } catch (error) {
-    console.error('Error getting logs:', error);
+    logger.error('Error getting logs:', error);
     res.status(500).json({ success: false, error: 'Error getting logs' });
   }
 };
 
 // Clear all logs
-export const clearLogs = (req: Request, res: Response): void => {
+export const clearLogs = async (req: Request, res: Response): Promise<void> => {
+  if (!(await requireAdmin(req, res))) return;
+
   try {
     logService.clearLogs();
     res.json({ success: true, message: 'Logs cleared successfully' });
   } catch (error) {
-    console.error('Error clearing logs:', error);
+    logger.error('Error clearing logs:', error);
     res.status(500).json({ success: false, error: 'Error clearing logs' });
   }
 };
 
 // Stream logs via SSE
-export const streamLogs = (req: Request, res: Response): void => {
+export const streamLogs = async (req: Request, res: Response): Promise<void> => {
+  if (!(await requireAdmin(req, res))) return;
+
   try {
     // Set headers for SSE
     res.writeHead(200, {
@@ -46,10 +54,10 @@ export const streamLogs = (req: Request, res: Response): void => {
     // Handle client disconnect
     req.on('close', () => {
       unsubscribe();
-      console.log('Client disconnected from log stream');
+      logger.log('Client disconnected from log stream');
     });
   } catch (error) {
-    console.error('Error streaming logs:', error);
+    logger.error('Error streaming logs:', error);
     res.status(500).json({ success: false, error: 'Error streaming logs' });
   }
 };

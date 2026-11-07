@@ -1,7 +1,9 @@
 import React, { createContext, useState, useEffect, useRef, useCallback, useContext } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Server, ApiResponse } from '@/types';
-import { apiGet, apiPost, apiDelete } from '../utils/fetchInterceptor';
+import { applyServerListPatch } from '@/utils/serverListState';
+import { disconnectServerOAuth as disconnectServerOAuthRequest } from '@/services/serverOAuthService';
+import { apiDelete, apiGet, apiPost, apiPut } from '../utils/fetchInterceptor';
 import { useAuth } from './AuthContext';
 
 const SERVERS_PER_PAGE_KEY = 'mcphub_servers_per_page';
@@ -31,7 +33,7 @@ const CONFIG = {
   },
   // Normal operation phase configuration
   normal: {
-    pollingInterval: 10000, // Polling interval during normal operation (10 seconds)
+    pollingInterval: 30000, // Polling interval during normal operation (30 seconds)
   },
 };
 
@@ -44,6 +46,11 @@ interface PaginationInfo {
   hasNextPage: boolean;
   hasPrevPage: boolean;
 }
+
+type ServerListResponse = ApiResponse<Server[]> & {
+  pagination?: PaginationInfo;
+  allServers?: Server[];
+};
 
 // Context type definition
 interface ServerContextType {
@@ -64,7 +71,10 @@ interface ServerContextType {
   handleServerEdit: (server: Server) => Promise<any>;
   handleServerRemove: (serverName: string) => Promise<boolean>;
   handleServerToggle: (server: Server, enabled: boolean) => Promise<boolean>;
+  handleServerVisibilityChange: (server: Server, visibility: 'private' | 'group' | 'public') => Promise<boolean>;
   handleServerReload: (server: Server) => Promise<boolean>;
+  handleServerReinstall: (server: Server) => Promise<boolean>;
+  handleServerOAuthDisconnect: (server: Server) => Promise<boolean>;
 }
 
 // Create Context
@@ -101,6 +111,27 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     }
   };
 
+  const applyServerResponse = useCallback((serverData: ServerListResponse | Server[]) => {
+    if (serverData && !Array.isArray(serverData) && serverData.success && Array.isArray(serverData.data)) {
+      setServers(serverData.data);
+      setAllServers(Array.isArray(serverData.allServers) ? serverData.allServers : serverData.data);
+      setPagination(serverData.pagination ?? null);
+      return;
+    }
+
+    if (Array.isArray(serverData)) {
+      setServers(serverData);
+      setAllServers(serverData);
+      setPagination(null);
+      return;
+    }
+
+    console.error('Invalid server data format', { serverData });
+    setServers([]);
+    setAllServers([]);
+    setPagination(null);
+  }, []);
+
   // Start normal polling
   const startNormalPolling = useCallback(
     (options?: { immediate?: boolean }) => {
@@ -116,42 +147,11 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           params.append('page', currentPage.toString());
           params.append('limit', serversPerPage.toString());
 
-          // Fetch both paginated servers and all servers in parallel
-          const [paginatedData, allData] = await Promise.all([
-            apiGet(`/servers?${params.toString()}`),
-            apiGet('/servers'), // Fetch all servers without pagination
-          ]);
+          const serverData = (await apiGet(`/servers?${params.toString()}`)) as ServerListResponse;
 
           // Update last fetch time
           lastFetchTimeRef.current = Date.now();
-
-          // Handle paginated response
-          if (paginatedData && paginatedData.success && Array.isArray(paginatedData.data)) {
-            setServers(paginatedData.data);
-            // Update pagination info if available
-            if (paginatedData.pagination) {
-              setPagination(paginatedData.pagination);
-            } else {
-              setPagination(null);
-            }
-          } else if (paginatedData && Array.isArray(paginatedData)) {
-            // Compatibility handling for non-paginated responses
-            setServers(paginatedData);
-            setPagination(null);
-          } else {
-            console.error('Invalid server data format', { paginatedData });
-            setServers([]);
-            setPagination(null);
-          }
-
-          // Handle all servers response
-          if (allData && allData.success && Array.isArray(allData.data)) {
-            setAllServers(allData.data);
-          } else if (allData && Array.isArray(allData)) {
-            setAllServers(allData);
-          } else {
-            setAllServers([]);
-          }
+          applyServerResponse(serverData);
 
           // Reset error state
           setError(null);
@@ -180,7 +180,7 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       // Set up regular polling
       intervalRef.current = setInterval(fetchServers, CONFIG.normal.pollingInterval);
     },
-    [t, currentPage, serversPerPage],
+    [applyServerResponse, t, currentPage, serversPerPage],
   );
 
   // Watch for authentication status changes
@@ -222,43 +222,11 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         params.append('page', currentPage.toString());
         params.append('limit', serversPerPage.toString());
 
-        // Fetch both paginated servers and all servers in parallel
-        const [paginatedData, allData] = await Promise.all([
-          apiGet(`/servers?${params.toString()}`),
-          apiGet('/servers'), // Fetch all servers without pagination
-        ]);
+        const serverData = (await apiGet(`/servers?${params.toString()}`)) as ServerListResponse;
 
         // Update last fetch time
         lastFetchTimeRef.current = Date.now();
-
-        // Handle paginated API response wrapper object, extract data field
-        if (paginatedData && paginatedData.success && Array.isArray(paginatedData.data)) {
-          setServers(paginatedData.data);
-          // Update pagination info if available
-          if (paginatedData.pagination) {
-            setPagination(paginatedData.pagination);
-          } else {
-            setPagination(null);
-          }
-        } else if (paginatedData && Array.isArray(paginatedData)) {
-          // Compatibility handling, if API directly returns array
-          setServers(paginatedData);
-          setPagination(null);
-        } else {
-          // If data format is not as expected, set to empty array
-          console.error('Invalid server data format', { paginatedData });
-          setServers([]);
-          setPagination(null);
-        }
-
-        // Handle all servers response
-        if (allData && allData.success && Array.isArray(allData.data)) {
-          setAllServers(allData.data);
-        } else if (allData && Array.isArray(allData)) {
-          setAllServers(allData);
-        } else {
-          setAllServers([]);
-        }
+        applyServerResponse(serverData);
 
         setIsInitialLoading(false);
         // Initialization successful, start normal polling (skip immediate to avoid duplicate fetch)
@@ -316,7 +284,7 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     return () => {
       clearTimer();
     };
-  }, [refreshKey, t, isInitialLoading, startNormalPolling, currentPage, serversPerPage]);
+  }, [applyServerResponse, refreshKey, t, isInitialLoading, startNormalPolling, currentPage, serversPerPage]);
 
   useEffect(() => {
     if (!pagination) {
@@ -438,11 +406,53 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           return false;
         }
 
-        // Update the UI immediately to reflect the change
+        setServers((prev) => applyServerListPatch(prev, server.name, { enabled }));
+        setAllServers((prev) => applyServerListPatch(prev, server.name, { enabled }));
         setRefreshKey((prevKey) => prevKey + 1);
         return true;
       } catch (err) {
         console.error('Error toggling server', { serverName: server.name, err });
+        setError(err instanceof Error ? err.message : String(err));
+        return false;
+      }
+    },
+    [t],
+  );
+
+  const handleServerVisibilityChange = useCallback(
+    async (server: Server, visibility: 'private' | 'group' | 'public') => {
+      try {
+        const encodedServerName = encodeURIComponent(server.name);
+        const serverData: ApiResponse<{
+          name: string;
+          status: string;
+          tools: any[];
+          config: Record<string, any>;
+        }> = await apiGet(`/servers/${encodedServerName}`);
+
+        if (!serverData || !serverData.success || !serverData.data?.config) {
+          setError(t('server.invalidConfig', { serverName: server.name }));
+          return false;
+        }
+
+        const result = await apiPut(`/servers/${encodedServerName}`, {
+          config: {
+            ...serverData.data.config,
+            visibility,
+          },
+        });
+
+        if (!result || !result.success) {
+          setError(result?.message || t('server.updateError', { serverName: server.name }));
+          return false;
+        }
+
+        setServers((prev) => applyServerListPatch(prev, server.name, { visibility }));
+        setAllServers((prev) => applyServerListPatch(prev, server.name, { visibility }));
+        setRefreshKey((prevKey) => prevKey + 1);
+        return true;
+      } catch (err) {
+        console.error('Error updating server visibility', { serverName: server.name, err });
         setError(err instanceof Error ? err.message : String(err));
         return false;
       }
@@ -467,6 +477,52 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         return true;
       } catch (err) {
         console.error('Error reloading server', { serverName: server.name, err });
+        setError(err instanceof Error ? err.message : String(err));
+        return false;
+      }
+    },
+    [t, triggerRefresh],
+  );
+
+  const handleServerReinstall = useCallback(
+    async (server: Server) => {
+      try {
+        const encodedServerName = encodeURIComponent(server.name);
+        const result = await apiPost(`/servers/${encodedServerName}/reinstall`, {});
+
+        if (!result || !result.success) {
+          console.error('Failed to reinstall server', { serverName: server.name, result });
+          setError(result?.message || t('server.reinstallError', { serverName: server.name }));
+          return false;
+        }
+
+        // Refresh server list after successful reinstall
+        triggerRefresh();
+        return true;
+      } catch (err) {
+        console.error('Error reinstalling server', { serverName: server.name, err });
+        setError(err instanceof Error ? err.message : String(err));
+        return false;
+      }
+    },
+    [t, triggerRefresh],
+  );
+
+  const handleServerOAuthDisconnect = useCallback(
+    async (server: Server) => {
+      try {
+        const result = await disconnectServerOAuthRequest(server.name);
+
+        if (!result || !result.success) {
+          console.error('Failed to disconnect server OAuth', { serverName: server.name, result });
+          setError(result?.message || t('server.disconnectOAuthError', { serverName: server.name }));
+          return false;
+        }
+
+        triggerRefresh();
+        return true;
+      } catch (err) {
+        console.error('Error disconnecting server OAuth', { serverName: server.name, err });
         setError(err instanceof Error ? err.message : String(err));
         return false;
       }
@@ -509,7 +565,10 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     handleServerEdit,
     handleServerRemove,
     handleServerToggle,
+    handleServerVisibilityChange,
     handleServerReload,
+    handleServerReinstall,
+    handleServerOAuthDisconnect,
   };
 
   return <ServerContext.Provider value={value}>{children}</ServerContext.Provider>;

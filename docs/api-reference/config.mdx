@@ -18,7 +18,7 @@ Updates various parts of the system configuration. You only need to provide the 
 
 - **Endpoint**: `/api/system-config`
 - **Method**: `PUT`
-- **Body**: A JSON object containing one or more of the following top-level keys: `routing`, `install`, `smartRouting`, `mcpRouter`.
+- **Body**: A JSON object containing one or more of the following top-level keys: `routing`, `install`, `smartRouting`, `toolResultCompression`, `mcpRouter`.
 
 #### Routing Configuration (`routing`)
 
@@ -28,7 +28,7 @@ Updates various parts of the system configuration. You only need to provide the 
 - `bearerAuthKey` (string): Legacy bearer key (used only for one-time migration).
 - `bearerAuthHeaderName` (string): Header name used to receive MCP bearer credentials (default: `Authorization`). Change this when upstream passthrough headers also use `Authorization`.
 - `jsonBodyLimit` (string): Express JSON body size limit (default: `1mb`). This applies to large inline OpenAPI schema uploads too.
-- `skipAuth` (boolean): If true, skips dashboard login requirements. This does **not** disable MCP endpoint authentication.
+- `skipAuth` (boolean): If true, skips dashboard/web API login requirements so the frontend can call `/api` routes without a session token. Unauthenticated dashboard users are treated as the built-in `guest` administrator, so enable this only in trusted environments. This does **not** disable MCP endpoint authentication.
 
 #### Install Configuration (`install`)
 
@@ -40,9 +40,20 @@ Updates various parts of the system configuration. You only need to provide the 
 
 - `enabled` (boolean): Enable or disable the Smart Routing feature.
 - `dbUrl` (string): The database connection URL for storing embeddings.
-- `openaiApiBaseUrl` (string): The base URL for the OpenAI-compatible API for generating embeddings.
-- `openaiApiKey` (string): The API key for the embeddings service.
-- `openaiApiEmbeddingModel` (string): The name of the embedding model to use.
+- `llmProviderBaseUrl` (string): The base URL for the OpenAI-compatible API for generating embeddings.
+- `llmProviderApiKey` (string): The API key for the embeddings service.
+- `embeddingModel` (string): The name of the embedding model to use.
+- `embeddingDimensions` (number, optional): The output dimensionality for providers that support configurable dimensions. Leave unset to use the model default. This value also declares the expected storage dimension, but it is only forwarded to the provider as the `dimensions` request parameter for models known to support Matryoshka (MRL) representations, or when `embeddingDimensionsApiPassthrough` is enabled (issue #1131).
+- `embeddingDimensionsApiPassthrough` (boolean, optional, default `false`): When `true`, always forward `embeddingDimensions` to the provider as the `dimensions` request parameter. Non-MRL models/backends (Qwen3-Embedding, BGE, vLLM/sglang) reject the parameter outright; enable only for other MRL-capable models. See also `EMBEDDING_DIMENSIONS_API_PASSTHROUGH`.
+
+#### Tool Result Compression Configuration (`toolResultCompression`)
+
+- `enabled` (boolean): Enable transparent compression for successful tool results.
+- `minTokens` (number): Only compress text blocks at or above this estimated token count. Default: `2000`.
+- `maxOutputTokens` (number): Target token budget for each compressed text block. Default: `1200`.
+- `strategy` (string): Compression strategy. Allowed values: `auto`, `json`, `log`, `search`, `diff`, `text`. Default: `auto`.
+
+Compression applies only to successful tool responses. `isError: true` responses and non-text content blocks are returned unchanged. Activity logging records the original upstream output before compression.
 
 #### MCP Router Configuration (`mcpRouter`)
 
@@ -63,6 +74,12 @@ Updates various parts of the system configuration. You only need to provide the 
     "smartRouting": {
       "enabled": true,
       "dbUrl": "postgresql://user:pass@host:port/db"
+    },
+    "toolResultCompression": {
+      "enabled": true,
+      "minTokens": 2000,
+      "maxOutputTokens": 1200,
+      "strategy": "auto"
     }
   }
   ```
@@ -114,3 +131,15 @@ Retrieves public configuration, primarily to check if authentication is skipped.
     }
   }
   ```
+
+## Session rebuild
+
+Set `enableSessionRebuild` to `true` to recreate a missing Streamable HTTP session
+using its existing ID. This does not restore the client's negotiated capabilities.
+Single-upstream routes accept both raw and prefixed tool names, allowing cached
+ordinary tool calls to continue. MCP Apps metadata and app-only tools still require
+a fresh initialization that advertises Apps support.
+
+When rebuild is disabled, requests with an unknown session ID return HTTP 404 so
+the client can initialize a new session. Requests missing a required session ID
+continue to return HTTP 400.

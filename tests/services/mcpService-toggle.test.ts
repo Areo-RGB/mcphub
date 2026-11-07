@@ -4,6 +4,7 @@ const mockSaveToolsAsVectorEmbeddings = jest.fn().mockResolvedValue(undefined);
 const mockClientConnect = jest.fn().mockResolvedValue(undefined);
 const mockClientClose = jest.fn();
 const mockListTools = jest.fn().mockResolvedValue({ tools: [] });
+const mockStderrListeners = new Map<string, (data?: Buffer) => void>();
 
 jest.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
   Client: jest.fn().mockImplementation(() => ({
@@ -18,7 +19,9 @@ jest.mock('@modelcontextprotocol/sdk/client/stdio.js', () => ({
   StdioClientTransport: jest.fn().mockImplementation(() => ({
     close: jest.fn(),
     stderr: {
-      on: jest.fn(),
+      on: jest.fn((event: string, listener: (data?: Buffer) => void) => {
+        mockStderrListeners.set(event, listener);
+      }),
     },
   })),
 }));
@@ -89,7 +92,7 @@ jest.mock('../../src/config/index.js', () => ({
 }));
 
 jest.mock('../../src/services/keepAliveService.js', () => ({
-  setupClientKeepAlive: jest.fn(),
+  setupClientKeepAlive: jest.fn().mockResolvedValue(undefined),
 }));
 
 jest.mock('../../src/services/activityLoggingService.js', () => ({
@@ -99,11 +102,24 @@ jest.mock('../../src/services/activityLoggingService.js', () => ({
 }));
 
 // Import after mocks
-import { summarizeServerConnections, toggleServerStatus } from '../../src/services/mcpService.js';
+import {
+  deleteMcpServer,
+  getServerByName,
+  getMcpServer,
+  initializeClientsFromSettings,
+  resetServerOAuthConnection,
+  setServerInfosForTest,
+  summarizeServerConnections,
+  toggleServerStatus,
+} from '../../src/services/mcpService.js';
 
 describe('mcpService toggleServerStatus', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    setServerInfosForTest([]);
+    mockServerDao.findAll.mockResolvedValue([]);
+    mockServerDao.setEnabled.mockResolvedValue(true);
+    mockClientConnect.mockResolvedValue(undefined);
   });
 
   describe('when disabling a server', () => {
@@ -165,6 +181,209 @@ describe('mcpService toggleServerStatus', () => {
       expect(result.success).toBe(false);
       expect(result.message).toBe('Failed to toggle server status');
     });
+  });
+});
+
+describe('mcpService initializeClientsFromSettings OAuth authorization reuse', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    setServerInfosForTest([]);
+    mockServerDao.findAll.mockResolvedValue([]);
+    mockClientConnect.mockResolvedValue(undefined);
+    mockStderrListeners.clear();
+  });
+
+  it('does not reconnect a server with an in-flight OAuth authorization during full reload', async () => {
+    setServerInfosForTest([
+      {
+        name: 'notion',
+        status: 'oauth_required',
+        error: null,
+        tools: [],
+        prompts: [],
+        resources: [],
+        createTime: 123,
+        enabled: true,
+        oauth: {
+          authorizationUrl: 'https://auth.example/authorize?code_challenge=old',
+          state: 'state-1',
+        },
+      } as any,
+    ]);
+    mockServerDao.findAll.mockResolvedValueOnce([
+      {
+        name: 'notion',
+        enabled: true,
+        command: 'node',
+        args: ['server.js'],
+        oauth: {
+          pendingAuthorization: {
+            authorizationUrl: 'https://auth.example/authorize?code_challenge=old',
+            state: 'state-1',
+            codeVerifier: 'verifier-1',
+          },
+        },
+      },
+    ]);
+
+    const servers = await initializeClientsFromSettings(false);
+
+    expect(mockClientConnect).not.toHaveBeenCalled();
+    expect(servers).toHaveLength(1);
+    expect(servers[0]).toMatchObject({
+      name: 'notion',
+      status: 'oauth_required',
+      enabled: true,
+      oauth: {
+        authorizationUrl: 'https://auth.example/authorize?code_challenge=old',
+        state: 'state-1',
+      },
+    });
+  });
+
+  it('includes upstream stderr when a stdio server connection closes', async () => {
+    mockServerDao.findAll.mockResolvedValueOnce([
+      {
+        name: 'fetch',
+        enabled: true,
+        command: 'uvx',
+        args: ['mcp-server-fetch'],
+      },
+    ]);
+    mockClientConnect.mockImplementationOnce(async () => {
+      mockStderrListeners.get('data')?.(
+        Buffer.from('ImportError: token=secret cannot import name McpError\n'),
+      );
+      throw Object.assign(new Error('MCP error -32000: Connection closed'), { code: -32000 });
+    });
+
+    const servers = await initializeClientsFromSettings(true);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(servers[0]).toMatchObject({
+      status: 'disconnected',
+    });
+    expect(servers[0].error).toContain('MCP error -32000: Connection closed');
+    expect(servers[0].error).toContain(
+      'Upstream stderr:\nImportError: token=[REDACTED] cannot import name McpError',
+    );
+    expect(console.error).toHaveBeenCalledWith(
+      'Failed to connect client for server',
+      expect.objectContaining({
+        serverName: 'fetch',
+        error: expect.objectContaining({
+          code: -32000,
+          upstreamStderr: 'ImportError: token=[REDACTED] cannot import name McpError',
+        }),
+      }),
+    );
+  });
+});
+
+describe('mcpService resetServerOAuthConnection', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    setServerInfosForTest([]);
+    mockServerDao.findAll.mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    deleteMcpServer('oauth-reset-session');
+  });
+
+  it('broadcasts capability list changes after clearing OAuth-protected capabilities', async () => {
+    const mcpServer = await getMcpServer('oauth-reset-session');
+    const sendToolListChanged = jest
+      .spyOn(mcpServer, 'sendToolListChanged')
+      .mockResolvedValue(undefined);
+    const sendPromptListChanged = jest
+      .spyOn(mcpServer, 'sendPromptListChanged')
+      .mockResolvedValue(undefined);
+    const sendResourceListChanged = jest
+      .spyOn(mcpServer, 'sendResourceListChanged')
+      .mockResolvedValue(undefined);
+
+    setServerInfosForTest([
+      {
+        name: 'notion',
+        status: 'connected',
+        error: null,
+        tools: [{ name: 'search', description: 'Search', inputSchema: {} }],
+        prompts: [{ name: 'summarize', description: 'Summarize' }],
+        resources: [{ uri: 'notion://page/1', name: 'Page', description: '' }],
+        createTime: 123,
+        enabled: true,
+      } as any,
+    ]);
+
+    expect(resetServerOAuthConnection('notion')).toBe(true);
+
+    expect(sendToolListChanged).toHaveBeenCalledTimes(1);
+    expect(sendPromptListChanged).toHaveBeenCalledTimes(1);
+    expect(sendResourceListChanged).toHaveBeenCalledTimes(1);
+    expect(getServerByName('notion')).toEqual(
+      expect.objectContaining({
+        status: 'oauth_required',
+        tools: [],
+        prompts: [],
+        resources: [],
+        oauth: undefined,
+      }),
+    );
+  });
+
+  it('uses generic close diagnostics when resetting OAuth state', () => {
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const closeError = new Error('close failed: code_verifier=pkce-secret');
+    const keepAliveIntervalId = setInterval(() => undefined, 1000);
+
+    try {
+      setServerInfosForTest([
+        {
+          name: 'notion access_token=server-secret',
+          status: 'connected',
+          error: null,
+          tools: [],
+          prompts: [],
+          resources: [],
+          createTime: 123,
+          enabled: true,
+          client: {
+            close: jest.fn(() => {
+              throw closeError;
+            }),
+          },
+          transport: {
+            close: jest.fn(() => {
+              throw closeError;
+            }),
+          },
+          keepAliveIntervalId,
+          oauth: {
+            authorizationUrl: 'https://auth.example/authorize?code_challenge=challenge',
+            state: 'state-1',
+          },
+        } as any,
+      ]);
+
+      expect(resetServerOAuthConnection('notion access_token=server-secret')).toBe(true);
+
+      const diagnosticArgs = [...logSpy.mock.calls, ...warnSpy.mock.calls].flat();
+      expect(diagnosticArgs).toEqual([
+        'Cleared MCP server keep-alive interval',
+        'Closed MCP server client and transport',
+        'Error closing MCP client during runtime shutdown',
+        'Error closing MCP transport during runtime shutdown',
+      ]);
+      expect(JSON.stringify(diagnosticArgs)).not.toContain('pkce-secret');
+      expect(JSON.stringify(diagnosticArgs)).not.toContain('server-secret');
+      expect(JSON.stringify(diagnosticArgs)).not.toContain('code_verifier');
+    } finally {
+      logSpy.mockRestore();
+      warnSpy.mockRestore();
+      clearInterval(keepAliveIntervalId);
+    }
   });
 });
 

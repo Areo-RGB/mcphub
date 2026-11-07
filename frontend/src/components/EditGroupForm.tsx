@@ -3,7 +3,9 @@ import { useTranslation } from 'react-i18next';
 import { Group, GroupFormData, Server, IGroupServerConfig } from '@/types';
 import { useGroupData } from '@/hooks/useGroupData';
 import { useServerData } from '@/hooks/useServerData';
+import { useCostData } from '@/hooks/useCostData';
 import { ServerToolConfig } from './ServerToolConfig';
+import GroupVisibilityFields from './GroupVisibilityFields';
 
 interface EditGroupFormProps {
   group: Group;
@@ -15,11 +17,14 @@ const EditGroupForm = ({ group, onEdit, onCancel }: EditGroupFormProps) => {
   const { t } = useTranslation();
   const { updateGroup } = useGroupData();
   const { allServers } = useServerData();
+  const { serverCosts } = useCostData();
   const [availableServers, setAvailableServers] = useState<Server[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const [formData, setFormData] = useState<GroupFormData>({
+    visibility: group.visibility,
+    sharedWithUsers: group.sharedWithUsers || [],
     name: group.name,
     description: group.description || '',
     servers: group.servers || [],
@@ -51,6 +56,8 @@ const EditGroupForm = ({ group, onEdit, onCancel }: EditGroupFormProps) => {
       }
 
       const result = await updateGroup(group.id, {
+        visibility: formData.visibility,
+        sharedWithUsers: formData.sharedWithUsers,
         name: formData.name,
         description: formData.description,
         servers: formData.servers,
@@ -71,12 +78,12 @@ const EditGroupForm = ({ group, onEdit, onCancel }: EditGroupFormProps) => {
 
   return (
     <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-      <div className="bg-white rounded-lg shadow-lg max-w-3xl w-full max-h-[90vh] flex flex-col">
+      <div className="bg-white dark:bg-gray-800 rounded-lg shadow-lg max-w-3xl w-full max-h-[90vh] flex flex-col">
         <div className="p-6 flex-shrink-0">
           <h2 className="text-xl font-semibold text-gray-800 mb-4">{t('groups.edit')}</h2>
 
           {error && (
-            <div className="mb-4 p-3 bg-red-100 text-red-700 rounded-md border border-gray-200">
+            <div className="mb-4 p-3 bg-red-100 text-red-700 rounded-md border border-gray-200 dark:border-gray-700">
               {error}
             </div>
           )}
@@ -109,26 +116,24 @@ const EditGroupForm = ({ group, onEdit, onCancel }: EditGroupFormProps) => {
                   servers={availableServers}
                   value={formData.servers as IGroupServerConfig[]}
                   onChange={(servers) => setFormData((prev) => ({ ...prev, servers }))}
-                  className="border border-gray-200 rounded-lg p-4 bg-gray-50"
+                  className="border border-gray-200 dark:border-gray-700 rounded-lg p-4 bg-gray-50 dark:bg-gray-800"
+                  serverCosts={serverCosts}
                 />
               </div>
+
+              <GroupVisibilityFields
+                groupId={group.id}
+                value={formData}
+                onChange={(access) => setFormData((previous) => ({ ...previous, ...access }))}
+              />
             </div>
           </div>
 
-          <div className="flex justify-end space-x-3 p-6 pt-4 border-t border-gray-200 flex-shrink-0">
-            <button
-              type="button"
-              onClick={onCancel}
-              className="px-4 py-2 text-gray-600 hover:text-gray-800 border border-gray-300 rounded-md hover:bg-gray-50 transition-colors"
-              disabled={isSubmitting}
-            >
+          <div className="flex justify-end space-x-2 p-5 pt-3 border-t border-[var(--hub-line-2)] flex-shrink-0">
+            <button type="button" onClick={onCancel} className="hub-btn" disabled={isSubmitting}>
               {t('common.cancel')}
             </button>
-            <button
-              type="submit"
-              className="px-4 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600 disabled:opacity-50 transition-colors"
-              disabled={isSubmitting}
-            >
+            <button type="submit" className="hub-btn primary" disabled={isSubmitting}>
               {isSubmitting ? t('common.submitting') : t('common.save')}
             </button>
           </div>

@@ -16,11 +16,12 @@ const DEFAULT_RETRY_OPTIONS: RetryOptions = {
  * Repository for BearerKey entity with automatic retry logic
  */
 export class BearerKeyRepository {
-  private repository: Repository<BearerKey>;
+  private get repository(): Repository<BearerKey> {
+    return getAppDataSource().getRepository(BearerKey);
+  }
   private retryOptions: RetryOptions;
 
   constructor(retryOptions?: RetryOptions) {
-    this.repository = getAppDataSource().getRepository(BearerKey);
     this.retryOptions = { ...DEFAULT_RETRY_OPTIONS, ...retryOptions };
   }
 
@@ -62,6 +63,13 @@ export class BearerKeyRepository {
     return this.withRetry(() => this.repository.findOne({ where: { token } }), 'findByToken');
   }
 
+  async findByOwner(owner: string): Promise<BearerKey[]> {
+    return this.withRetry(
+      () => this.repository.find({ where: { kind: 'user', owner }, order: { createdAt: 'ASC' } }),
+      'findByOwner',
+    );
+  }
+
   /**
    * Create a new bearer key
    */
@@ -97,6 +105,13 @@ export class BearerKeyRepository {
       const result = await this.repository.delete({ id });
       return (result.affected ?? 0) > 0;
     }, 'delete');
+  }
+
+  async deleteByOwner(owner: string): Promise<number> {
+    return this.withRetry(async () => {
+      const result = await this.repository.delete({ kind: 'user', owner });
+      return result.affected ?? 0;
+    }, 'deleteByOwner');
   }
 }
 

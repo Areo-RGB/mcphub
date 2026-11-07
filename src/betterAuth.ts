@@ -1,14 +1,32 @@
 import { betterAuth, BetterAuthOptions } from 'better-auth';
+import { genericOAuth } from 'better-auth/plugins';
 import { PostgresDialect } from 'kysely';
 import { Pool } from 'pg';
-import defaultConfig from './config/index.js';
+import defaultConfig, { loadSettings } from './config/index.js';
 import {
-  betterAuthRuntimeConfig,
-  getBetterAuthRuntimeConfig,
+  resolveBetterAuthBaseUrl,
+  resolveBetterAuthRuntimeConfig,
 } from './services/betterAuthConfig.js';
+import { getCachedSystemConfig, isDatabaseModeEnabled } from './utils/systemConfigCache.js';
+import { logger } from './utils/logger.js';
 
-const runtimeConfig = getBetterAuthRuntimeConfig();
+const resolveSystemConfig = () => {
+  const cachedSystemConfig = getCachedSystemConfig();
+  if (cachedSystemConfig) {
+    return cachedSystemConfig;
+  }
+
+  if (!isDatabaseModeEnabled()) {
+    return loadSettings().systemConfig ?? null;
+  }
+
+  return null;
+};
+
+const systemConfig = resolveSystemConfig();
+const runtimeConfig = resolveBetterAuthRuntimeConfig(systemConfig);
 const socialProviders: Record<string, { clientId: string; clientSecret: string }> = {};
+const plugins: any[] = [];
 if (
   runtimeConfig.providers.google.enabled &&
   process.env.GOOGLE_CLIENT_ID &&
@@ -29,6 +47,49 @@ if (
     clientSecret: process.env.GITHUB_CLIENT_SECRET,
   };
 }
+if (
+  runtimeConfig.providers.oidc.enabled &&
+  runtimeConfig.providers.oidc.discoveryUrl &&
+  process.env.OIDC_CLIENT_ID &&
+  process.env.OIDC_CLIENT_SECRET
+) {
+  plugins.push(
+    genericOAuth({
+      config: [
+        {
+          providerId: runtimeConfig.providers.oidc.providerId,
+          discoveryUrl: runtimeConfig.providers.oidc.discoveryUrl,
+          clientId: process.env.OIDC_CLIENT_ID,
+          clientSecret: process.env.OIDC_CLIENT_SECRET,
+          scopes: runtimeConfig.providers.oidc.scopes,
+          pkce: runtimeConfig.providers.oidc.pkce,
+          prompt: runtimeConfig.providers.oidc.prompt,
+          // Some OIDC issuers (e.g. self-hosted GitLab < 16.0) do not include
+          // a `name` claim in the ID token; better-auth only exposes it via
+          // the userinfo endpoint, which it skips whenever an id_token is
+          // present. Synthesize a display name from the remaining claims so
+          // that sign-in succeeds for such issuers.
+          mapProfileToUser: (profile) => ({
+            name:
+              profile.name ||
+              profile.nickname ||
+              profile.preferred_username ||
+              (typeof profile.email === 'string' && profile.email.split('@')[0]) ||
+              `oidc-${String(profile.id ?? profile.sub ?? '')}`,
+          }),
+        },
+      ],
+    }),
+  );
+}
+
+const trimTrailingSlashes = (value: string): string => {
+  let end = value.length;
+  while (end > 0 && value[end - 1] === '/') {
+    end -= 1;
+  }
+  return value.slice(0, end);
+};
 
 const resolveBaseURL = (baseUrl: string, basePath: string): string => {
   const normalizedPath = basePath.startsWith('/') ? basePath : `/${basePath}`;
@@ -41,16 +102,17 @@ const resolveBaseURL = (baseUrl: string, basePath: string): string => {
     if (url.pathname.endsWith(normalizedPath)) {
       return url.toString();
     }
-    url.pathname = `${url.pathname.replace(/\/+$/, '')}${normalizedPath}`;
+    url.pathname = `${trimTrailingSlashes(url.pathname)}${normalizedPath}`;
     return url.toString();
   } catch {
-    const trimmedBase = baseUrl.replace(/\/+$/, '');
+    const trimmedBase = trimTrailingSlashes(baseUrl);
     return `${trimmedBase}${normalizedPath}`;
   }
 };
 
+const betterAuthBaseUrl = resolveBetterAuthBaseUrl(systemConfig);
 const baseURL = resolveBaseURL(
-  process.env.BETTER_AUTH_URL || `http://localhost:${defaultConfig.port}${defaultConfig.basePath}`,
+  betterAuthBaseUrl || `http://localhost:${defaultConfig.port}${defaultConfig.basePath}`,
   runtimeConfig.basePath,
 );
 
@@ -59,8 +121,22 @@ if (!databaseUrl) {
   throw new Error('DB_URL is required for Better Auth PostgreSQL storage.');
 }
 
+// Keep the Better Auth pool aligned with the main TypeORM pool so a DB
+// incident cannot make Better Auth requests queue forever: pg defaults have no
+// connection timeout (wait indefinitely) and a max of 10 on top of TypeORM's
+// pool. Postgres-side safety valves (0 = PostgreSQL default / disabled) stop a
+// hung query or idle-in-transaction session from holding a connection
+// indefinitely (#1205).
 const pool = new Pool({
   connectionString: databaseUrl,
+  max: parseInt(process.env.DB_POOL_SIZE || '10', 10),
+  connectionTimeoutMillis: parseInt(process.env.DB_CONNECTION_TIMEOUT || '60000', 10),
+  idleTimeoutMillis: parseInt(process.env.DB_POOL_IDLE_TIMEOUT || '30000', 10),
+  statement_timeout: parseInt(process.env.DB_STATEMENT_TIMEOUT || '0', 10),
+  idle_in_transaction_session_timeout: parseInt(
+    process.env.DB_IDLE_IN_TRANSACTION_TIMEOUT || '0',
+    10,
+  ),
 });
 
 const database = new PostgresDialect({
@@ -73,13 +149,25 @@ const authOptions: BetterAuthOptions = {
   emailAndPassword: {
     enabled: false,
   },
+  account: {
+    accountLinking: {
+      enabled: true,
+      trustedProviders: [
+        ...(runtimeConfig.providers.oidc.enabled && runtimeConfig.providers.oidc.trustEmail
+          ? [runtimeConfig.providers.oidc.providerId]
+          : []),
+      ],
+    },
+  },
+  plugins,
   socialProviders,
+  trustedOrigins: runtimeConfig.trustedOrigins,
   logger: {
     disabled: false,
     disableColors: false,
     level: 'info',
     log: (level, message, ...args) => {
-      console.log('[better-auth]', { level, message }, ...args);
+      logger.log('[better-auth]', { level, message }, ...args);
     },
   },
 };
@@ -127,11 +215,11 @@ const isRelationAlreadyExistsError = (error: unknown): boolean => {
 };
 
 export const ensureBetterAuthSchema = async (): Promise<void> => {
-  if (!getBetterAuthRuntimeConfig().enabled) {
+  if (!runtimeConfig.enabled) {
     return;
   }
 
-  const { getMigrations } = await import('better-auth/db');
+  const { getMigrations } = await import('better-auth/db/migration');
   const { toBeCreated, toBeAdded, runMigrations } = await getMigrations(authOptions);
 
   if (!toBeCreated.length && !toBeAdded.length) {
@@ -147,7 +235,7 @@ export const ensureBetterAuthSchema = async (): Promise<void> => {
       const existingTables = await listExistingTables(schema, tableNames);
       const allTablesExist = tableNames.every((tableName) => existingTables.has(tableName));
       if (allTablesExist && !toBeAdded.length) {
-        console.warn(
+        logger.warn(
           `[better-auth] Detected existing tables in schema "${schema}"; skipping migrations.`,
         );
         return;
@@ -159,10 +247,10 @@ export const ensureBetterAuthSchema = async (): Promise<void> => {
     await runMigrations();
   } catch (error) {
     if (isRelationAlreadyExistsError(error)) {
-      console.warn('[better-auth] Migration skipped due to existing relations.', error);
+      logger.warn('[better-auth] Migration skipped due to existing relations.', error);
       return;
     }
     throw error;
   }
 };
-export { betterAuthRuntimeConfig };
+export { runtimeConfig as betterAuthRuntimeConfig };

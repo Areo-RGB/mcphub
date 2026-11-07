@@ -9,7 +9,21 @@ export class DataService {
     if (!currentUser || currentUser.isAdmin) {
       return data;
     } else {
-      return data.filter((item) => item.owner === currentUser?.username);
+      return data.filter((item) => {
+        if (item.owner === currentUser?.username) return true;
+        // Visibility introduced in #817. Issue #1037 activates the restricted
+        // 'group' scope for explicitly selected local usernames.
+        if (item.visibility === 'public') return true;
+        if (
+          currentUser &&
+          item.visibility === 'group' &&
+          Array.isArray(item.sharedWithUsers) &&
+          item.sharedWithUsers.includes(currentUser.username)
+        ) {
+          return true;
+        }
+        return false;
+      });
     }
   }
 

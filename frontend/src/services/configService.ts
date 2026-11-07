@@ -14,6 +14,7 @@ export interface SystemConfig {
   install?: {
     pythonIndexUrl?: string;
     npmRegistry?: string;
+    baseUrl?: string;
   };
   smartRouting?: {
     enabled?: boolean;
@@ -21,26 +22,43 @@ export interface SystemConfig {
     basePacingDelayMs?: number;
     embeddingProvider?: 'openai' | 'azure_openai';
     embeddingEncodingFormat?: 'auto' | 'base64' | 'float';
-    openaiApiBaseUrl?: string;
-    openaiApiKey?: string;
-    openaiApiEmbeddingModel?: string;
+    embeddingDimensions?: number;
+    embeddingDimensionsApiPassthrough?: boolean;
+    llmProviderBaseUrl?: string;
+    llmProviderApiKey?: string;
+    embeddingModel?: string;
     azureOpenaiEndpoint?: string;
     azureOpenaiApiKey?: string;
     azureOpenaiApiVersion?: string;
     azureOpenaiEmbeddingDeployment?: string;
     embeddingMaxTokens?: number;
   };
+  toolResultCompression?: {
+    enabled?: boolean;
+    minTokens?: number;
+    maxOutputTokens?: number;
+    strategy?: 'auto' | 'json' | 'log' | 'search' | 'diff' | 'text';
+  };
   nameSeparator?: string;
   auth?: {
     betterAuth?: {
       enabled?: boolean;
       basePath?: string;
+      trustedOrigins?: string[];
       providers?: {
         google?: {
           enabled?: boolean;
         };
         github?: {
           enabled?: boolean;
+        };
+        oidc?: {
+          enabled?: boolean;
+          providerId?: string;
+          discoveryUrl?: string;
+          scopes?: string[];
+          pkce?: boolean;
+          prompt?: string;
         };
       };
     };
@@ -49,13 +67,23 @@ export interface SystemConfig {
 
 interface BetterAuthConfig {
   enabled?: boolean;
+  baseUrl?: string;
   basePath?: string;
+  trustedOrigins?: string[];
   providers?: {
     google?: {
       enabled?: boolean;
     };
     github?: {
       enabled?: boolean;
+    };
+    oidc?: {
+      enabled?: boolean;
+      providerId?: string;
+      discoveryUrl?: string;
+      scopes?: string[];
+      pkce?: boolean;
+      prompt?: string;
     };
   };
 }

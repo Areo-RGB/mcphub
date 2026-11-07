@@ -61,6 +61,7 @@ jest.mock('../../src/middlewares/userContext.js', () => ({
 jest.mock('../../src/utils/rateLimit.js', () => ({
   __esModule: true,
   mcpConnectionRateLimiter: mcpConnectionRateLimiterMock,
+  spaPageRateLimiter: mcpConnectionRateLimiterMock,
 }));
 
 import { AppServer } from '../../src/server.js';
@@ -69,11 +70,20 @@ const flushPromises = async () => {
   await new Promise((resolve) => setImmediate(resolve));
 };
 
+const originalEnv = process.env;
+
 describe('AppServer MCP routes use rate limiting', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    process.env = { ...originalEnv };
+    delete process.env.TRUST_PROXY;
+    delete process.env.KUBERNETES_SERVICE_HOST;
     sseUserContextMiddlewareMock.mockImplementation((_req, _res, next) => next());
     mcpConnectionRateLimiterMock.mockImplementation((_req, _res, next) => next());
+  });
+
+  afterAll(() => {
+    process.env = originalEnv;
   });
 
   const createApp = async () => {
@@ -97,5 +107,13 @@ describe('AppServer MCP routes use rate limiting', () => {
     expect(handleSseMessageMock).toHaveBeenCalledTimes(1);
     expect(handleMcpPostRequestMock).toHaveBeenCalledTimes(1);
     expect(handleMcpOtherRequestMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('trusts a single proxy by default in container-style deployments', () => {
+    process.env.KUBERNETES_SERVICE_HOST = '10.96.0.1';
+
+    const appServer = new AppServer();
+
+    expect(appServer.getApp().get('trust proxy')).toBe(1);
   });
 });

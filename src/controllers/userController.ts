@@ -1,3 +1,4 @@
+import { deleteCredentialBindings } from '../services/credentialBindingService.js';
 import { Request, Response } from 'express';
 import { ApiResponse } from '../types/index.js';
 import {
@@ -8,18 +9,12 @@ import {
   deleteUser,
   getUserCount,
   getAdminCount,
+  checkReservedUsername,
 } from '../services/userService.js';
-import { getSystemConfigDao } from '../dao/index.js';
 import { validatePasswordStrength } from '../utils/passwordValidation.js';
 
 // Admin permission check middleware function
 const requireAdmin = async (req: Request, res: Response): Promise<boolean> => {
-  const systemConfigDao = getSystemConfigDao();
-  const systemConfig = await systemConfigDao.get();
-  if (systemConfig?.routing?.skipAuth) {
-    return true;
-  }
-
   const user = (req as any).user;
   if (!user || !user.isAdmin) {
     res.status(403).json({
@@ -92,7 +87,7 @@ export const createUser = async (req: Request, res: Response): Promise<void> => 
   if (!(await requireAdmin(req, res))) return;
 
   try {
-    const { username, password, isAdmin } = req.body;
+    const { username, password, isAdmin, email } = req.body;
 
     if (!username || !password) {
       res.status(400).json({
@@ -113,7 +108,17 @@ export const createUser = async (req: Request, res: Response): Promise<void> => 
       return;
     }
 
-    const newUser = await createNewUser(username, password, isAdmin || false);
+    // Check username against reserved names (e.g. "system", "admin")
+    const reservedError = checkReservedUsername(username);
+    if (reservedError) {
+      res.status(400).json({
+        success: false,
+        message: reservedError,
+      });
+      return;
+    }
+
+    const newUser = await createNewUser(username, password, isAdmin || false, email);
     if (!newUser) {
       res.status(400).json({
         success: false,
@@ -143,7 +148,7 @@ export const updateExistingUser = async (req: Request, res: Response): Promise<v
 
   try {
     const { username } = req.params;
-    const { isAdmin, newPassword } = req.body;
+    const { isAdmin, newPassword, email } = req.body;
 
     if (!username) {
       res.status(400).json({
@@ -176,6 +181,7 @@ export const updateExistingUser = async (req: Request, res: Response): Promise<v
 
     const updateData: any = {};
     if (isAdmin !== undefined) updateData.isAdmin = isAdmin;
+    if (email !== undefined) updateData.email = email;
     if (newPassword) {
       // Validate new password strength
       const validationResult = validatePasswordStrength(newPassword);
@@ -193,7 +199,7 @@ export const updateExistingUser = async (req: Request, res: Response): Promise<v
     if (Object.keys(updateData).length === 0) {
       res.status(400).json({
         success: false,
-        message: 'At least one field (isAdmin or newPassword) is required to update',
+        message: 'At least one field (isAdmin, email, or newPassword) is required to update',
       });
       return;
     }
@@ -247,6 +253,7 @@ export const deleteExistingUser = async (req: Request, res: Response): Promise<v
     }
 
     const success = await deleteUser(username);
+    if (success) await deleteCredentialBindings({ username });
     if (!success) {
       res.status(400).json({
         success: false,

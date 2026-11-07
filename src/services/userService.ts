@@ -1,5 +1,6 @@
 import { IUser } from '../types/index.js';
-import { getUserDao } from '../dao/index.js';
+import { getBearerKeyDao, getUserDao } from '../dao/index.js';
+import { logger } from '../utils/logger.js';
 
 // Get all users
 export const getAllUsers = async (): Promise<IUser[]> => {
@@ -14,22 +15,44 @@ export const getUserByUsername = async (username: string): Promise<IUser | undef
   return user || undefined;
 };
 
+/** Usernames reserved for system use (case-insensitive). */
+const RESERVED_USERNAMES = ['system', 'admin', 'guest', 'root'];
+
+/**
+ * Check if a username is reserved for system use.
+ * Returns the reason string if reserved, or null if allowed.
+ */
+export const checkReservedUsername = (username: string): string | null => {
+  const lower = username.toLowerCase();
+  if (RESERVED_USERNAMES.includes(lower)) {
+    return `Username "${username}" is reserved and cannot be used`;
+  }
+  return null;
+};
+
 // Create a new user
 export const createNewUser = async (
   username: string,
   password: string,
   isAdmin: boolean = false,
+  email?: string,
 ): Promise<IUser | null> => {
   try {
+    const reservedError = checkReservedUsername(username);
+    if (reservedError) {
+      logger.warn(`User creation blocked: ${reservedError}`);
+      return null;
+    }
+
     const userDao = getUserDao();
     const existingUser = await userDao.findByUsername(username);
     if (existingUser) {
       return null; // User already exists
     }
 
-    return await userDao.createWithHashedPassword(username, password, isAdmin);
+    return await userDao.createWithHashedPassword(username, password, isAdmin, email || undefined);
   } catch (error) {
-    console.error('Failed to create user:', error);
+    logger.error('Failed to create user:', error);
     return null;
   }
 };
@@ -37,7 +60,7 @@ export const createNewUser = async (
 // Update user information
 export const updateUser = async (
   username: string,
-  data: { isAdmin?: boolean; newPassword?: string },
+  data: { isAdmin?: boolean; newPassword?: string; email?: string },
 ): Promise<IUser | null> => {
   try {
     const userDao = getUserDao();
@@ -55,6 +78,14 @@ export const updateUser = async (
       }
     }
 
+    // Update email if provided
+    if (data.email !== undefined) {
+      const result = await userDao.update(username, { email: data.email || null });
+      if (!result) {
+        return null;
+      }
+    }
+
     // Update password if provided
     if (data.newPassword) {
       const success = await userDao.updatePassword(username, data.newPassword);
@@ -66,7 +97,7 @@ export const updateUser = async (
     // Return updated user
     return await userDao.findByUsername(username);
   } catch (error) {
-    console.error('Failed to update user:', error);
+    logger.error('Failed to update user:', error);
     return null;
   }
 };
@@ -85,9 +116,13 @@ export const deleteUser = async (username: string): Promise<boolean> => {
       return false; // Cannot delete the last admin
     }
 
-    return await userDao.delete(username);
+    const deleted = await userDao.delete(username);
+    if (deleted) {
+      await getBearerKeyDao().deleteByOwner(username);
+    }
+    return deleted;
   } catch (error) {
-    console.error('Failed to delete user:', error);
+    logger.error('Failed to delete user:', error);
     return false;
   }
 };

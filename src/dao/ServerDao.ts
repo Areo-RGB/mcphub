@@ -1,6 +1,7 @@
 import { ServerConfig } from '../types/index.js';
 import { BaseDao } from './base/BaseDao.js';
 import { JsonFileBaseDao } from './base/JsonFileBaseDao.js';
+import { unpackStartOnDemandOptions } from '../utils/serverConfigPersistence.js';
 
 /**
  * Pagination result interface
@@ -25,7 +26,21 @@ export interface ServerDao extends BaseDao<ServerConfigWithName, string> {
   /**
    * Find servers by owner with pagination
    */
-  findByOwnerPaginated(owner: string, page: number, limit: number): Promise<PaginatedResult<ServerConfigWithName>>;
+  findByOwnerPaginated(
+    owner: string,
+    page: number,
+    limit: number,
+  ): Promise<PaginatedResult<ServerConfigWithName>>;
+
+  /**
+   * Find servers visible to a non-admin user with pagination.
+   * Visible means owned by the user or marked public.
+   */
+  findVisibleToUserPaginated(
+    username: string,
+    page: number,
+    limit: number,
+  ): Promise<PaginatedResult<ServerConfigWithName>>;
 
   /**
    * Find servers by owner
@@ -93,9 +108,21 @@ export class ServerDaoImpl extends JsonFileBaseDao implements ServerDao {
     const servers: ServerConfigWithName[] = [];
 
     for (const [name, config] of Object.entries(settings.mcpServers || {})) {
+      // startOnDemand/idleTimeoutMs are mirrored into `options` by
+      // normalizeServerConfigForPersistence() so database-backed installs can
+      // persist them (see ServerDaoDbImpl). Unpack + strip the mirrored keys
+      // here too so JSON-mode behaves the same way: no duplicate/stale
+      // options.startOnDemand noise in mcp_settings.json or API responses.
+      const { options, startOnDemand, idleTimeoutMs } = unpackStartOnDemandOptions(
+        config.options,
+      );
+
       servers.push({
         name,
         ...config,
+        options,
+        ...(startOnDemand !== undefined ? { startOnDemand } : {}),
+        ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
       });
     }
 
@@ -205,7 +232,10 @@ export class ServerDaoImpl extends JsonFileBaseDao implements ServerDao {
     return servers.length;
   }
 
-  async findAllPaginated(page: number, limit: number): Promise<PaginatedResult<ServerConfigWithName>> {
+  async findAllPaginated(
+    page: number,
+    limit: number,
+  ): Promise<PaginatedResult<ServerConfigWithName>> {
     const allServers = await this.getAll();
     // Sort: enabled servers first, then by creation time
     const sortedServers = allServers.sort((a, b) => {
@@ -216,7 +246,7 @@ export class ServerDaoImpl extends JsonFileBaseDao implements ServerDao {
       }
       return 0; // Keep original order for same enabled status
     });
-    
+
     const total = sortedServers.length;
     const totalPages = Math.ceil(total / limit);
     const startIndex = (page - 1) * limit;
@@ -232,7 +262,11 @@ export class ServerDaoImpl extends JsonFileBaseDao implements ServerDao {
     };
   }
 
-  async findByOwnerPaginated(owner: string, page: number, limit: number): Promise<PaginatedResult<ServerConfigWithName>> {
+  async findByOwnerPaginated(
+    owner: string,
+    page: number,
+    limit: number,
+  ): Promise<PaginatedResult<ServerConfigWithName>> {
     const allServers = await this.getAll();
     const filteredServers = allServers.filter((server) => server.owner === owner);
     // Sort: enabled servers first, then by creation time
@@ -244,7 +278,43 @@ export class ServerDaoImpl extends JsonFileBaseDao implements ServerDao {
       }
       return 0; // Keep original order for same enabled status
     });
-    
+
+    const total = sortedServers.length;
+    const totalPages = Math.ceil(total / limit);
+    const startIndex = (page - 1) * limit;
+    const endIndex = startIndex + limit;
+    const data = sortedServers.slice(startIndex, endIndex);
+
+    return {
+      data,
+      total,
+      page,
+      limit,
+      totalPages,
+    };
+  }
+
+  async findVisibleToUserPaginated(
+    username: string,
+    page: number,
+    limit: number,
+  ): Promise<PaginatedResult<ServerConfigWithName>> {
+    const allServers = await this.getAll();
+    const filteredServers = allServers.filter(
+      (server) =>
+        server.owner === username ||
+        server.visibility === 'public' ||
+        (server.visibility === 'group' && server.sharedWithUsers?.includes(username)),
+    );
+    const sortedServers = filteredServers.sort((a, b) => {
+      const aEnabled = a.enabled !== false;
+      const bEnabled = b.enabled !== false;
+      if (aEnabled !== bEnabled) {
+        return aEnabled ? -1 : 1;
+      }
+      return 0;
+    });
+
     const total = sortedServers.length;
     const totalPages = Math.ceil(total / limit);
     const startIndex = (page - 1) * limit;

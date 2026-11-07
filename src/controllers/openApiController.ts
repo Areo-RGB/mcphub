@@ -1,4 +1,6 @@
 import { Request, Response } from 'express';
+import { dump as dumpYaml } from 'js-yaml';
+import { OpenAPIV3 } from 'openapi-types';
 import {
   generateOpenAPISpec,
   getAvailableServers,
@@ -9,11 +11,35 @@ import { getServerByName } from '../services/mcpService.js';
 import { getGroupByIdOrName } from '../services/groupService.js';
 import { getNameSeparator } from '../config/index.js';
 import { convertParametersToTypes } from '../utils/parameterConversion.js';
+import { logger } from '../utils/logger.js';
 
 /**
  * Controller for OpenAPI generation endpoints
  * Provides OpenAPI specifications for MCP tools to enable OpenWebUI integration
  */
+
+const isYamlSpecRequest = (req: Request): boolean => req.path.toLowerCase().endsWith('.yaml');
+
+const setOpenAPISpecHeaders = (
+  res: Response,
+  contentType: 'application/json' | 'application/yaml',
+): void => {
+  res.setHeader('Content-Type', contentType);
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+};
+
+const sendOpenAPISpec = (req: Request, res: Response, openApiSpec: OpenAPIV3.Document): void => {
+  if (isYamlSpecRequest(req)) {
+    setOpenAPISpecHeaders(res, 'application/yaml');
+    res.send(dumpYaml(openApiSpec, { noRefs: true, lineWidth: -1 }));
+    return;
+  }
+
+  setOpenAPISpecHeaders(res, 'application/json');
+  res.json(openApiSpec);
+};
 
 /**
  * Generate and return OpenAPI specification
@@ -33,14 +59,9 @@ export const getOpenAPISpec = async (req: Request, res: Response): Promise<void>
 
     const openApiSpec = await generateOpenAPISpec(options);
 
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-    res.json(openApiSpec);
+    sendOpenAPISpec(req, res, openApiSpec);
   } catch (error) {
-    console.error('Error generating OpenAPI specification:', error);
+    logger.error('Error generating OpenAPI specification:', error);
     res.status(500).json({
       error: 'Failed to generate OpenAPI specification',
       message: error instanceof Error ? error.message : 'Unknown error',
@@ -60,7 +81,7 @@ export const getOpenAPIServers = async (req: Request, res: Response): Promise<vo
       data: servers,
     });
   } catch (error) {
-    console.error('Error getting available servers:', error);
+    logger.error('Error getting available servers:', error);
     res.status(500).json({
       success: false,
       error: 'Failed to get available servers',
@@ -81,7 +102,7 @@ export const getOpenAPIStats = async (req: Request, res: Response): Promise<void
       data: stats,
     });
   } catch (error) {
-    console.error('Error getting tool statistics:', error);
+    logger.error('Error getting tool statistics:', error);
     res.status(500).json({
       success: false,
       error: 'Failed to get tool statistics',
@@ -146,7 +167,7 @@ export const executeToolViaOpenAPI = async (req: Request, res: Response): Promis
     // Return the result in OpenAPI format (matching MCP tool response structure)
     res.json(result);
   } catch (error) {
-    console.error('Error executing tool via OpenAPI:', error);
+    logger.error('Error executing tool via OpenAPI:', error);
     res.status(500).json({
       error: 'Failed to execute tool',
       message: error instanceof Error ? error.message : 'Unknown error',
@@ -184,14 +205,9 @@ export const getServerOpenAPISpec = async (req: Request, res: Response): Promise
 
     const openApiSpec = await generateOpenAPISpec(options);
 
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-    res.json(openApiSpec);
+    sendOpenAPISpec(req, res, openApiSpec);
   } catch (error) {
-    console.error('Error generating server OpenAPI specification:', error);
+    logger.error('Error generating server OpenAPI specification:', error);
     res.status(500).json({
       error: 'Failed to generate server OpenAPI specification',
       message: error instanceof Error ? error.message : 'Unknown error',
@@ -226,14 +242,9 @@ export const getGroupOpenAPISpec = async (req: Request, res: Response): Promise<
 
     const openApiSpec = await generateOpenAPISpec(options);
 
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-    res.json(openApiSpec);
+    sendOpenAPISpec(req, res, openApiSpec);
   } catch (error) {
-    console.error('Error generating group OpenAPI specification:', error);
+    logger.error('Error generating group OpenAPI specification:', error);
     res.status(500).json({
       error: 'Failed to generate group OpenAPI specification',
       message: error instanceof Error ? error.message : 'Unknown error',

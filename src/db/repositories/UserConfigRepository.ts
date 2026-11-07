@@ -6,10 +6,8 @@ import { getAppDataSource } from '../connection.js';
  * Repository for UserConfig entity
  */
 export class UserConfigRepository {
-  private repository: Repository<UserConfig>;
-
-  constructor() {
-    this.repository = getAppDataSource().getRepository(UserConfig);
+  private get repository(): Repository<UserConfig> {
+    return getAppDataSource().getRepository(UserConfig);
   }
 
   /**
@@ -64,7 +62,10 @@ export class UserConfigRepository {
   /**
    * Get a specific configuration section for a user
    */
-  async getSection<K extends keyof UserConfig>(username: string, section: K): Promise<UserConfig[K] | null> {
+  async getSection<K extends keyof UserConfig>(
+    username: string,
+    section: K,
+  ): Promise<UserConfig[K] | null> {
     const config = await this.get(username);
     return config ? config[section] : null;
   }

@@ -33,14 +33,29 @@ const parseCommaSeparatedList = (value?: string): string[] => {
     .filter((item) => item.length > 0);
 };
 
+const normalizeSharedUsers = (usernames?: string[]): string[] => {
+  return Array.from(
+    new Set(
+      (usernames || [])
+        .map((username) => username.trim())
+        .filter((username) => username.length > 0),
+    ),
+  );
+};
+
 const buildOptions = (options?: ServerFormData['options']) => {
   const nextOptions: NonNullable<ServerFormData['options']> = {};
 
-  if (options?.timeout && options.timeout !== 60000) {
+  // Always echo the timeout, even when it equals the 60000 default: dropping it
+  // makes the payload differ from a stored explicit `timeout: 60000` and trips
+  // the backend's "connection changed" fast-path check on unrelated edits. The
+  // backend comparison normalizes the default timeout, so an explicit 60000 and
+  // an absent one compare as equal.
+  if (typeof options?.timeout === 'number' && !Number.isNaN(options.timeout)) {
     nextOptions.timeout = options.timeout;
   }
 
-  if (options?.resetTimeoutOnProgress) {
+  if (typeof options?.resetTimeoutOnProgress === 'boolean') {
     nextOptions.resetTimeoutOnProgress = options.resetTimeoutOnProgress;
   }
 
@@ -86,6 +101,25 @@ const buildOAuthConfig = (
   if (tokenEndpoint) nextOAuth.tokenEndpoint = tokenEndpoint;
   if (resource) nextOAuth.resource = resource;
 
+  // Faithful pass-through of the non-editable OAuth sub-fields: the
+  // `dynamicRegistration` sub-object (RFC7591) plus `revocationEndpoint`
+  // (RFC 7009) and `redirectUri`. They are never rendered in the form, only
+  // round-tripped, and the backend `normalizeOAuth`
+  // (src/utils/serverConfigPersistence.ts) whitelist preserves them (#1193),
+  // so a faithful re-emission survives persistence. The three fields are
+  // declared once on `ServerFormData['oauth']` (frontend/src/types/index.ts),
+  // so they can be read directly here; a key is only emitted when the form
+  // actually carries it.
+  if (oauth.dynamicRegistration) {
+    nextOAuth.dynamicRegistration = oauth.dynamicRegistration;
+  }
+  if (oauth.revocationEndpoint) {
+    nextOAuth.revocationEndpoint = oauth.revocationEndpoint;
+  }
+  if (oauth.redirectUri) {
+    nextOAuth.redirectUri = oauth.redirectUri;
+  }
+
   return nextOAuth;
 };
 
@@ -93,7 +127,12 @@ const buildOpenApiConfig = (formData: ServerFormData): NonNullable<ServerConfig[
   const openapi: NonNullable<ServerConfig['openapi']> = {
     version: formData.openapi?.version || '3.1.0',
     passthroughHeaders: parseCommaSeparatedList(formData.openapi?.passthroughHeaders),
+    cookieSession: formData.openapi?.cookieSession === true ? true : undefined,
   };
+  const oauth2TokenUrl = formData.openapi?.oauth2TokenUrl?.trim();
+  const oauth2ClientId = formData.openapi?.oauth2ClientId?.trim();
+  const oauth2ClientSecret = formData.openapi?.oauth2ClientSecret?.trim();
+  const oauth2Token = formData.openapi?.oauth2Token?.trim();
 
   if (formData.openapi?.inputMode === 'url') {
     openapi.url = formData.openapi?.url || '';
@@ -123,13 +162,53 @@ const buildOpenApiConfig = (formData: ServerFormData): NonNullable<ServerConfig[
       }),
       ...(formData.openapi.securityType === 'oauth2' && {
         oauth2: {
-          token: formData.openapi.oauth2Token || '',
+          ...(oauth2TokenUrl && {
+            tokenUrl: oauth2TokenUrl,
+          }),
+          ...(oauth2ClientId && {
+            clientId: oauth2ClientId,
+          }),
+          ...(oauth2ClientSecret && {
+            clientSecret: oauth2ClientSecret,
+          }),
+          ...(oauth2Token && {
+            token: oauth2Token,
+          }),
         },
       }),
       ...(formData.openapi.securityType === 'openIdConnect' && {
         openIdConnect: {
           url: formData.openapi.openIdConnectUrl || '',
           token: formData.openapi.openIdConnectToken || '',
+        },
+      }),
+    };
+  }
+
+  // Separate credential for the spec document download (#1079). Only emitted
+  // when explicitly enabled; absent means "share the main `security`". oauth2
+  // here is a static token only — the dynamic client-credentials fetch exists
+  // just for the main `security`.
+  const specSecurityType = formData.openapi?.specSecurityType;
+  if (specSecurityType && specSecurityType !== 'none') {
+    openapi.specSecurity = {
+      type: specSecurityType,
+      ...(specSecurityType === 'apiKey' && {
+        apiKey: {
+          name: formData.openapi?.specApiKeyName || '',
+          in: formData.openapi?.specApiKeyIn || 'header',
+          value: formData.openapi?.specApiKeyValue || '',
+        },
+      }),
+      ...(specSecurityType === 'http' && {
+        http: {
+          scheme: formData.openapi?.specHttpScheme || 'basic',
+          credentials: formData.openapi?.specHttpCredentials || '',
+        },
+      }),
+      ...(specSecurityType === 'oauth2' && {
+        oauth2: {
+          token: formData.openapi?.specOauth2Token || '',
         },
       }),
     };
@@ -153,21 +232,37 @@ export const buildServerPayload = ({
     type: serverType,
     description,
     options,
+    visibility: formData.visibility ?? 'private',
+    sharedWithUsers:
+      formData.visibility === 'group' ? normalizeSharedUsers(formData.sharedWithUsers) : undefined,
+    credentialTemplate: formData.credentialTemplate?.map((slot) => ({
+      ...slot,
+      target: serverType === 'stdio' ? 'env' : 'headers',
+    })),
+    perSessionClient: formData.perSessionClient === true ? true : undefined,
+    startOnDemand: formData.startOnDemand === true ? true : undefined,
+    idleTimeoutMs:
+      formData.startOnDemand === true || formData.credentialTemplate?.length
+        ? (formData.idleTimeoutMs ?? 300000)
+        : undefined,
+    // Round-trip the stored proxychains config (no in-form editor) so an edit
+    // of any other field does not drop it and force an avoidable reload.
+    proxy: formData.proxy,
   };
 
   if (serverType === 'openapi') {
     config.headers = headers;
     config.openapi = buildOpenApiConfig(formData);
   } else if (serverType === 'sse' || serverType === 'streamable-http') {
+    const keepAliveEnabled = formData.keepAlive?.enabled === true;
+
     config.url = formData.url.trim();
     config.env = env;
     config.headers = headers;
     config.passthroughHeaders = parseCommaSeparatedList(formData.passthroughHeaders);
     config.oauth = buildOAuthConfig(formData.oauth);
-    config.enableKeepAlive = formData.keepAlive?.enabled || false;
-    config.keepAliveInterval = formData.keepAlive?.enabled
-      ? formData.keepAlive.interval || 60000
-      : undefined;
+    config.enableKeepAlive = keepAliveEnabled;
+    config.keepAliveInterval = keepAliveEnabled ? formData.keepAlive?.interval || 60000 : undefined;
   } else {
     config.command = formData.command.trim();
     config.args = formData.args;

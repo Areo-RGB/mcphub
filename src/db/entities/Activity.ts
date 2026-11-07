@@ -9,6 +9,7 @@ import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, Index } from 
 @Index(['tool'])
 @Index(['status'])
 @Index(['group'])
+@Index(['username'])
 @Index(['keyId'])
 @Index(['timestamp'])
 export class Activity {
@@ -39,11 +40,17 @@ export class Activity {
   @Column({ type: 'varchar', length: 255, nullable: true, name: 'group_name' })
   group?: string;
 
+  @Column({ type: 'varchar', length: 255, nullable: true, name: 'username' })
+  username?: string;
+
   @Column({ type: 'varchar', length: 255, nullable: true, name: 'key_id' })
   keyId?: string;
 
   @Column({ type: 'varchar', length: 255, nullable: true, name: 'key_name' })
   keyName?: string;
+
+  @Column({ type: 'varchar', length: 255, nullable: true, name: 'source_ip' })
+  sourceIp?: string;
 
   @Column({ type: 'text', nullable: true, name: 'error_message' })
   errorMessage?: string;

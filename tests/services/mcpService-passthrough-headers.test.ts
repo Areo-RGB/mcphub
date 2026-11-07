@@ -50,7 +50,7 @@ jest.mock('../../src/services/activityLoggingService.js', () => ({
 }));
 
 jest.mock('../../src/services/keepAliveService.js', () => ({
-  setupClientKeepAlive: jest.fn(),
+  setupClientKeepAlive: jest.fn().mockResolvedValue(undefined),
 }));
 
 jest.mock('../../src/services/proxy.js', () => ({
@@ -104,6 +104,7 @@ jest.mock('@modelcontextprotocol/sdk/client/stdio.js', () => ({
 }));
 
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { RequestContextService } from '../../src/services/requestContextService.js';
 import { createTransportFromConfig } from '../../src/services/mcpService.js';
@@ -225,6 +226,53 @@ describe('MCP Service - passthrough headers for upstream MCP transports', () => 
           'X-Custom-User-Id': 'user-99',
           'Content-Type': 'application/json',
         }),
+      }),
+    );
+  });
+
+  it('should use the current process working directory for stdio transports', async () => {
+    (StdioClientTransport as jest.Mock).mockImplementation(() => ({
+      stderr: {
+        on: jest.fn(),
+      },
+    }));
+
+    await createTransportFromConfig('demo-stdio', {
+      command: 'npx',
+      args: ['@playwright/mcp'],
+      env: {
+        DEMO_VAR: 'demo',
+      },
+    });
+
+    expect(StdioClientTransport).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cwd: process.cwd(),
+        command: 'npx',
+        args: ['@playwright/mcp'],
+        env: expect.objectContaining({
+          DEMO_VAR: 'demo',
+        }),
+        stderr: 'pipe',
+      }),
+    );
+  });
+
+  it('should create a stdio transport when command arguments are omitted', async () => {
+    (StdioClientTransport as jest.Mock).mockImplementation(() => ({
+      stderr: {
+        on: jest.fn(),
+      },
+    }));
+
+    await createTransportFromConfig('demo-stdio-without-args', {
+      command: '/usr/bin/some-tool',
+    });
+
+    expect(StdioClientTransport).toHaveBeenCalledWith(
+      expect.objectContaining({
+        command: '/usr/bin/some-tool',
+        args: [],
       }),
     );
   });

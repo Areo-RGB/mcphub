@@ -1,3 +1,4 @@
+import { listMyCredentials, updateMyCredential } from '../controllers/credentialBindingController.js';
 import express from 'express';
 import { check } from 'express-validator';
 import config from '../config/index.js';
@@ -5,12 +6,17 @@ import {
   getAllServers,
   getAllSettings,
   getServerConfig,
+  getServerShareCandidates,
   createServer,
   batchCreateServers,
+  previewOpenApiToolStatsHandler,
   updateServer,
   deleteServer,
   toggleServer,
   reloadServer,
+  reinstallServerHandler,
+  disconnectServerOAuth,
+  clearCache,
   toggleTool,
   updateToolDescription,
   resetToolDescription,
@@ -23,9 +29,18 @@ import {
   updateSystemConfig,
 } from '../controllers/serverController.js';
 import {
+  getServerCostsHandler,
+  getGroupCostsHandler,
+} from '../controllers/contextCostController.js';
+import {
+  getSmartRoutingPerformance,
+  reindexSmartRouting,
+} from '../controllers/smartRoutingController.js';
+import {
   getGroups,
   getGroup,
   createNewGroup,
+  getGroupShareCandidates,
   batchCreateGroups,
   updateExistingGroup,
   deleteExistingGroup,
@@ -70,6 +85,15 @@ import {
   getRegistryServerVersions,
   getRegistryServerVersion,
 } from '../controllers/registryController.js';
+import { getChangelogUpdateInfoHandler } from '../controllers/changelogController.js';
+import {
+  listDiscoveryServers,
+  getDiscoveryServer,
+  getDiscoveryServerInstall,
+  listDiscoveryCategories,
+  listDiscoveryTags,
+  getMarketplaceWellKnown,
+} from '../controllers/discoveryController.js';
 import { login, register, getCurrentUser, changePassword } from '../controllers/authController.js';
 import { getAllLogs, clearLogs, streamLogs } from '../controllers/logController.js';
 import {
@@ -142,22 +166,35 @@ import {
   deleteOldActivities,
 } from '../controllers/activityController.js';
 import {
+  getHostedInternalRuntimeCatalog,
+  receiveHostedInternalEvent,
+} from '../controllers/hostedInternalController.js';
+import {
   exportConfigTemplate,
   exportGroupAsTemplate,
   importConfigTemplate,
 } from '../controllers/templateController.js';
 import { auth } from '../middlewares/auth.js';
+import { requireAdminMiddleware } from '../utils/requireAdmin.js';
 import { getBetterAuthRuntimeConfig } from '../services/betterAuthConfig.js';
-import { authenticatedRouteRateLimiter, templateRateLimiter } from '../utils/rateLimit.js';
+import {
+  authAttemptRateLimiter,
+  authRegistrationRateLimiter,
+  authenticatedRouteRateLimiter,
+  hostedInternalEventRateLimiter,
+  mcpConnectionRateLimiter,
+  templateRateLimiter,
+} from '../utils/rateLimit.js';
 
 const router = express.Router();
+const authenticatedRouter = express.Router();
 
 export const initRoutes = async (app: express.Application): Promise<void> => {
   const isTestEnv =
     process.env.NODE_ENV === 'test' ||
     process.env.JEST_WORKER_ID !== undefined ||
     process.env.VITEST_WORKER_ID !== undefined;
-  const betterAuthConfig = getBetterAuthRuntimeConfig();
+  const betterAuthConfig = await getBetterAuthRuntimeConfig();
 
   if (betterAuthConfig.enabled && !isTestEnv) {
     const [{ auth: betterAuth, ensureBetterAuthSchema }, { toNodeHandler }] = await Promise.all([
@@ -173,76 +210,139 @@ export const initRoutes = async (app: express.Application): Promise<void> => {
   // Health check endpoint (no auth required, accessible at /health)
   app.get('/health', healthCheck);
 
+  // Hosted data-plane webhook ingress. HMAC-authenticated by INTERNAL_API_SECRET.
+  app.post('/internal/v1/events', hostedInternalEventRateLimiter, receiveHostedInternalEvent);
+  app.get(
+    '/internal/v1/hosted/runtime-catalog',
+    hostedInternalEventRateLimiter,
+    getHostedInternalRuntimeCatalog,
+  );
+
   // OAuth callback endpoint (no auth required, public callback URL)
-  app.get('/oauth/callback', handleOAuthCallback);
+  app.get('/oauth/callback', mcpConnectionRateLimiter, handleOAuthCallback);
 
   // OAuth Authorization Server endpoints (no auth required for OAuth flow)
-  app.get('/oauth/authorize', getAuthorize);
-  app.post('/oauth/authorize', express.urlencoded({ extended: true }), postAuthorize);
-  app.post('/oauth/token', express.urlencoded({ extended: true }), postToken); // Public endpoint for token exchange
-  app.get('/oauth/userinfo', getUserInfo); // Validates OAuth token
-  app.get('/.well-known/oauth-authorization-server', getMetadata); // Public metadata endpoint
-  app.get('/.well-known/oauth-protected-resource', getProtectedResourceMetadata); // Public protected resource metadata
+  app.get('/oauth/authorize', mcpConnectionRateLimiter, getAuthorize);
+  app.post(
+    '/oauth/authorize',
+    express.urlencoded({ extended: true }),
+    mcpConnectionRateLimiter,
+    postAuthorize,
+  );
+  app.post(
+    '/oauth/token',
+    express.urlencoded({ extended: true }),
+    mcpConnectionRateLimiter,
+    postToken,
+  ); // Public endpoint for token exchange
+  app.get('/oauth/userinfo', mcpConnectionRateLimiter, getUserInfo); // Validates OAuth token
+  app.get('/.well-known/oauth-authorization-server', mcpConnectionRateLimiter, getMetadata); // Public metadata endpoint
+  app.get(
+    /^\/\.well-known\/oauth-protected-resource(\/.*)?$/,
+    mcpConnectionRateLimiter,
+    getProtectedResourceMetadata,
+  ); // Public protected resource metadata, also path-specific (RFC 9728 §3.1), e.g. /mcp/phone
 
   // RFC 7591 Dynamic Client Registration endpoints (public for registration)
-  app.post('/oauth/register', registerClient); // Register new OAuth client
-  app.get('/oauth/register/:clientId', getClientConfiguration); // Read client configuration
-  app.put('/oauth/register/:clientId', updateClientConfiguration); // Update client configuration
-  app.delete('/oauth/register/:clientId', deleteClientRegistration); // Delete client registration
+  app.post('/oauth/register', mcpConnectionRateLimiter, registerClient); // Register new OAuth client
+  app.get('/oauth/register/:clientId', mcpConnectionRateLimiter, getClientConfiguration); // Read client configuration
+  app.put('/oauth/register/:clientId', mcpConnectionRateLimiter, updateClientConfiguration); // Update client configuration
+  app.delete('/oauth/register/:clientId', mcpConnectionRateLimiter, deleteClientRegistration); // Delete client registration
 
-  // API routes protected by auth middleware in middlewares/index.ts
-  router.get('/servers', getAllServers);
-  router.get('/servers/:name', getServerConfig);
-  router.get('/settings', getAllSettings);
-  router.post('/servers', createServer);
-  router.post('/servers/batch', batchCreateServers);
-  router.put('/servers/:name', updateServer);
-  router.delete('/servers/:name', deleteServer);
-  router.post('/servers/:name/toggle', toggleServer);
-  router.post('/servers/:name/reload', reloadServer);
-  router.post('/servers/:serverName/tools/:toolName/toggle', toggleTool);
-  router.put('/servers/:serverName/tools/:toolName/description', updateToolDescription);
-  router.delete('/servers/:serverName/tools/:toolName/description', resetToolDescription);
-  router.post('/servers/:serverName/prompts/:promptName/toggle', togglePrompt);
-  router.put('/servers/:serverName/prompts/:promptName/description', updatePromptDescription);
-  router.delete('/servers/:serverName/prompts/:promptName/description', resetPromptDescription);
-  router.post('/servers/:serverName/resources/:resourceUri/toggle', toggleResource);
-  router.put('/servers/:serverName/resources/:resourceUri/description', updateResourceDescription);
-  router.delete(
+  authenticatedRouter.use(authenticatedRouteRateLimiter);
+  // `authenticatedRouter` is mounted at the end of this function, after the public
+  // routes below have been registered on `router`. The order matters: the limiter
+  // above is a path-less `use`, so it runs for every request that reaches the
+  // sub-router - including ones that match no authenticated route and only fall
+  // through to a public route such as POST /api/auth/login. Mounting last lets
+  // those public routes match first, so they are governed by their own limiters
+  // instead of consuming the shared authenticated-route budget.
+
+  // API routes protected by auth middleware in middlewares/index.ts and rate limited here
+  authenticatedRouter.get('/credentials', listMyCredentials);
+  authenticatedRouter.put('/credentials/:name', updateMyCredential);
+  authenticatedRouter.delete('/credentials/:name', updateMyCredential);
+  authenticatedRouter.get('/servers', getAllServers);
+  authenticatedRouter.get('/servers/:name/share-candidates', getServerShareCandidates);
+  authenticatedRouter.get('/servers/:name', getServerConfig);
+  authenticatedRouter.get('/settings', getAllSettings);
+  authenticatedRouter.post('/servers', createServer);
+  authenticatedRouter.post('/servers/batch', batchCreateServers);
+  authenticatedRouter.post('/servers/openapi/tool-stats', previewOpenApiToolStatsHandler);
+  authenticatedRouter.put('/servers/:name', updateServer);
+  authenticatedRouter.delete('/servers/:name', deleteServer);
+  authenticatedRouter.post('/servers/:name/toggle', toggleServer);
+  authenticatedRouter.post('/servers/:name/reload', reloadServer);
+  authenticatedRouter.post('/servers/:name/reinstall', reinstallServerHandler);
+  authenticatedRouter.post('/servers/:name/oauth/disconnect', disconnectServerOAuth);
+  authenticatedRouter.post('/servers/:serverName/tools/:toolName/toggle', toggleTool);
+  authenticatedRouter.put(
+    '/servers/:serverName/tools/:toolName/description',
+    updateToolDescription,
+  );
+  authenticatedRouter.delete(
+    '/servers/:serverName/tools/:toolName/description',
+    resetToolDescription,
+  );
+  authenticatedRouter.post('/servers/:serverName/prompts/:promptName/toggle', togglePrompt);
+  authenticatedRouter.put(
+    '/servers/:serverName/prompts/:promptName/description',
+    updatePromptDescription,
+  );
+  authenticatedRouter.delete(
+    '/servers/:serverName/prompts/:promptName/description',
+    resetPromptDescription,
+  );
+  authenticatedRouter.post('/servers/:serverName/resources/:resourceUri/toggle', toggleResource);
+  authenticatedRouter.put(
+    '/servers/:serverName/resources/:resourceUri/description',
+    updateResourceDescription,
+  );
+  authenticatedRouter.delete(
     '/servers/:serverName/resources/:resourceUri/description',
     resetResourceDescription,
   );
-  router.put('/system-config', updateSystemConfig);
+  authenticatedRouter.put('/system-config', updateSystemConfig);
+  authenticatedRouter.post('/cache/clear', clearCache);
+
+  // Context Footprint cost routes
+  authenticatedRouter.get('/cost/servers', getServerCostsHandler);
+  authenticatedRouter.get('/cost/groups', getGroupCostsHandler);
+
+  // Smart Routing diagnostics and maintenance
+  authenticatedRouter.get('/smart-routing/performance', getSmartRoutingPerformance);
+  authenticatedRouter.post('/smart-routing/reindex', reindexSmartRouting);
 
   // Group management routes
-  router.get('/groups', getGroups);
-  router.get('/groups/:id', getGroup);
-  router.post('/groups', createNewGroup);
-  router.post('/groups/batch', batchCreateGroups);
-  router.put('/groups/:id', updateExistingGroup);
-  router.delete('/groups/:id', deleteExistingGroup);
-  router.post('/groups/:id/servers', addServerToExistingGroup);
-  router.delete('/groups/:id/servers/:serverName', removeServerFromExistingGroup);
-  router.get('/groups/:id/servers', getGroupServers);
+  authenticatedRouter.get('/groups', getGroups);
+  authenticatedRouter.get('/groups/:id', getGroup);
+  authenticatedRouter.get('/groups/:id/share-candidates', getGroupShareCandidates);
+  authenticatedRouter.post('/groups', createNewGroup);
+  authenticatedRouter.post('/groups/batch', batchCreateGroups);
+  authenticatedRouter.put('/groups/:id', updateExistingGroup);
+  authenticatedRouter.delete('/groups/:id', deleteExistingGroup);
+  authenticatedRouter.post('/groups/:id/servers', addServerToExistingGroup);
+  authenticatedRouter.delete('/groups/:id/servers/:serverName', removeServerFromExistingGroup);
+  authenticatedRouter.get('/groups/:id/servers', getGroupServers);
   // New route for batch updating servers in a group
-  router.put('/groups/:id/servers/batch', updateGroupServersBatch);
+  authenticatedRouter.put('/groups/:id/servers/batch', updateGroupServersBatch);
   // New routes for server configurations and tool management in groups
-  router.get('/groups/:id/server-configs', getGroupServerConfigs);
-  router.get('/groups/:id/server-configs/:serverName', getGroupServerConfig);
-  router.put('/groups/:id/server-configs/:serverName/tools', updateGroupServerTools);
+  authenticatedRouter.get('/groups/:id/server-configs', getGroupServerConfigs);
+  authenticatedRouter.get('/groups/:id/server-configs/:serverName', getGroupServerConfig);
+  authenticatedRouter.put('/groups/:id/server-configs/:serverName/tools', updateGroupServerTools);
 
   // User management routes (admin only)
-  router.get('/users', getUsers);
-  router.get('/users/:username', getUser);
-  router.post('/users', createUser);
-  router.put('/users/:username', updateExistingUser);
-  router.delete('/users/:username', deleteExistingUser);
-  router.get('/users-stats', getUserStats);
+  authenticatedRouter.get('/users', getUsers);
+  authenticatedRouter.get('/users/:username', getUser);
+  authenticatedRouter.post('/users', createUser);
+  authenticatedRouter.put('/users/:username', updateExistingUser);
+  authenticatedRouter.delete('/users/:username', deleteExistingUser);
+  authenticatedRouter.get('/users-stats', getUserStats);
 
   // OAuth Client management routes (admin only)
-  router.get('/oauth/clients', getAllClients);
-  router.get('/oauth/clients/:clientId', getClient);
-  router.post(
+  authenticatedRouter.get('/oauth/clients', getAllClients);
+  authenticatedRouter.get('/oauth/clients/:clientId', getClient);
+  authenticatedRouter.post(
     '/oauth/clients',
     [
       check('name', 'Client name is required').not().isEmpty(),
@@ -250,88 +350,101 @@ export const initRoutes = async (app: express.Application): Promise<void> => {
     ],
     createClient,
   );
-  router.put('/oauth/clients/:clientId', updateClient);
-  router.delete('/oauth/clients/:clientId', deleteClient);
-  router.post('/oauth/clients/:clientId/regenerate-secret', regenerateSecret);
+  authenticatedRouter.put('/oauth/clients/:clientId', updateClient);
+  authenticatedRouter.delete('/oauth/clients/:clientId', deleteClient);
+  authenticatedRouter.post('/oauth/clients/:clientId/regenerate-secret', regenerateSecret);
 
   // Bearer authentication key management (admin only)
-  router.get('/auth/keys', getBearerKeys);
-  router.post('/auth/keys', createBearerKey);
-  router.put('/auth/keys/:id', updateBearerKey);
-  router.delete('/auth/keys/:id', deleteBearerKey);
+  authenticatedRouter.get('/auth/keys', getBearerKeys);
+  authenticatedRouter.post('/auth/keys', createBearerKey);
+  authenticatedRouter.put('/auth/keys/:id', updateBearerKey);
+  authenticatedRouter.delete('/auth/keys/:id', deleteBearerKey);
 
   // Activity routes (database mode only)
-  router.get('/activities/available', checkActivityAvailable);
-  router.get('/activities', getActivities);
-  router.get('/activities/stats', getActivityStats);
-  router.get('/activities/filters', getActivityFilterOptions);
-  router.get('/activities/:id', getActivityById);
-  router.delete('/activities/cleanup', deleteOldActivities);
+  authenticatedRouter.get('/activities/available', checkActivityAvailable);
+  authenticatedRouter.get('/activities', getActivities);
+  authenticatedRouter.get('/activities/stats', getActivityStats);
+  authenticatedRouter.get('/activities/filters', getActivityFilterOptions);
+  authenticatedRouter.get('/activities/:id', getActivityById);
+  authenticatedRouter.delete('/activities/cleanup', deleteOldActivities);
 
   // Configuration template routes
-  router.post('/templates/export', templateRateLimiter, auth, exportConfigTemplate);
-  router.get('/templates/export/groups/:id', templateRateLimiter, auth, exportGroupAsTemplate);
-  router.post('/templates/import', templateRateLimiter, auth, importConfigTemplate);
+  authenticatedRouter.post('/templates/export', templateRateLimiter, auth, exportConfigTemplate);
+  authenticatedRouter.get(
+    '/templates/export/groups/:id',
+    templateRateLimiter,
+    auth,
+    exportGroupAsTemplate,
+  );
+  authenticatedRouter.post('/templates/import', templateRateLimiter, auth, importConfigTemplate);
 
   // Tool management routes
-  router.post('/tools/call/:server', callTool);
+  authenticatedRouter.post('/tools/call/:server', callTool);
 
   // Prompt management routes
-  router.post('/mcp/:serverName/prompts/:promptName', getPrompt);
+  authenticatedRouter.post('/mcp/:serverName/prompts/:promptName', getPrompt);
 
   // Built-in prompt management routes
-  router.get('/prompts', listBuiltinPrompts);
-  router.get('/prompts/:id', getBuiltinPrompt);
-  router.post('/prompts', createBuiltinPrompt);
-  router.put('/prompts/:id', updateBuiltinPrompt);
-  router.delete('/prompts/:id', deleteBuiltinPrompt);
+  authenticatedRouter.get('/prompts', listBuiltinPrompts);
+  authenticatedRouter.get('/prompts/:id', getBuiltinPrompt);
+  authenticatedRouter.post('/prompts', createBuiltinPrompt);
+  authenticatedRouter.put('/prompts/:id', updateBuiltinPrompt);
+  authenticatedRouter.delete('/prompts/:id', deleteBuiltinPrompt);
 
   // Built-in resource management routes
-  router.get('/resources', listBuiltinResources);
-  router.get('/resources/:id', getBuiltinResource);
-  router.post('/resources', createBuiltinResource);
-  router.put('/resources/:id', updateBuiltinResource);
-  router.delete('/resources/:id', deleteBuiltinResource);
-  router.post('/resources/read', readResource);
+  authenticatedRouter.get('/resources', listBuiltinResources);
+  authenticatedRouter.get('/resources/:id', getBuiltinResource);
+  authenticatedRouter.post('/resources', createBuiltinResource);
+  authenticatedRouter.put('/resources/:id', updateBuiltinResource);
+  authenticatedRouter.delete('/resources/:id', deleteBuiltinResource);
+  authenticatedRouter.post('/resources/read', readResource);
 
-  // MCPB upload routes
-  router.post('/mcpb/upload', uploadMiddleware, uploadMcpbFile);
+  // MCPB upload routes. Admin-only: the handler replaces the code at the
+  // deterministic `data/uploads/mcpb/server-<name>` path that existing stdio
+  // server configurations point into, so an unprivileged upload would be a
+  // second write path to the stdio execution boundary (GHSA-xf2m-3c3x-53vp).
+  // The admin gate must run before `uploadMiddleware` so multer never stages a
+  // non-admin upload body on disk.
+  authenticatedRouter.post('/mcpb/upload', requireAdminMiddleware, uploadMiddleware, uploadMcpbFile);
 
   // Market routes
-  router.get('/market/servers', getAllMarketServers);
-  router.get('/market/servers/search', searchMarketServersByQuery);
-  router.get('/market/servers/:name', getMarketServer);
-  router.get('/market/categories', getAllMarketCategories);
-  router.get('/market/categories/:category', getMarketServersByCategory);
-  router.get('/market/tags', getAllMarketTags);
-  router.get('/market/tags/:tag', getMarketServersByTag);
+  authenticatedRouter.get('/market/servers', getAllMarketServers);
+  authenticatedRouter.get('/market/servers/search', searchMarketServersByQuery);
+  authenticatedRouter.get('/market/servers/:name', getMarketServer);
+  authenticatedRouter.get('/market/categories', getAllMarketCategories);
+  authenticatedRouter.get('/market/categories/:category', getMarketServersByCategory);
+  authenticatedRouter.get('/market/tags', getAllMarketTags);
+  authenticatedRouter.get('/market/tags/:tag', getMarketServersByTag);
 
   // Cloud Market routes
-  router.get('/cloud/servers', getAllCloudServers);
-  router.get('/cloud/servers/search', searchCloudServersByQuery);
-  router.get('/cloud/servers/:name', getCloudServer);
-  router.get('/cloud/categories', getAllCloudCategories);
-  router.get('/cloud/categories/:category', getCloudServersByCategory);
-  router.get('/cloud/tags', getAllCloudTags);
-  router.get('/cloud/tags/:tag', getCloudServersByTag);
-  router.get('/cloud/servers/:serverName/tools', getCloudServerToolsList);
-  router.post('/cloud/servers/:serverName/tools/:toolName/call', callCloudTool);
+  authenticatedRouter.get('/cloud/servers', getAllCloudServers);
+  authenticatedRouter.get('/cloud/servers/search', searchCloudServersByQuery);
+  authenticatedRouter.get('/cloud/servers/:name', getCloudServer);
+  authenticatedRouter.get('/cloud/categories', getAllCloudCategories);
+  authenticatedRouter.get('/cloud/categories/:category', getCloudServersByCategory);
+  authenticatedRouter.get('/cloud/tags', getAllCloudTags);
+  authenticatedRouter.get('/cloud/tags/:tag', getCloudServersByTag);
+  authenticatedRouter.get('/cloud/servers/:serverName/tools', getCloudServerToolsList);
+  authenticatedRouter.post('/cloud/servers/:serverName/tools/:toolName/call', callCloudTool);
 
   // Registry routes (proxy to official MCP registry)
-  router.get('/registry/servers', getAllRegistryServers);
-  router.get('/registry/servers/:serverName/versions', getRegistryServerVersions);
-  router.get('/registry/servers/:serverName/versions/:version', getRegistryServerVersion);
+  authenticatedRouter.get('/registry/servers', getAllRegistryServers);
+  authenticatedRouter.get('/registry/servers/versions', getRegistryServerVersions);
+  authenticatedRouter.get('/registry/servers/version', getRegistryServerVersion);
+
+  // Changelog routes (proxy to mcphub-web changelog API)
+  authenticatedRouter.get('/changelog/update-info', getChangelogUpdateInfoHandler);
 
   // Log routes
-  router.get('/logs', getAllLogs);
-  router.delete('/logs', clearLogs);
-  router.get('/logs/stream', streamLogs);
+  authenticatedRouter.get('/logs', getAllLogs);
+  authenticatedRouter.delete('/logs', clearLogs);
+  authenticatedRouter.get('/logs/stream', streamLogs);
 
   // MCP settings export route
-  router.get('/mcp-settings/export', getMcpSettingsJson);
+  authenticatedRouter.get('/mcp-settings/export', getMcpSettingsJson);
 
-  // Auth routes - move to router instead of app directly
-  router.get('/better-auth/user', getBetterAuthUser);
+  // Better Auth user route requires authentication and shares the authenticated route limiter
+  authenticatedRouter.get('/better-auth/user', getBetterAuthUser);
 
   router.post(
     '/auth/login',
@@ -339,6 +452,7 @@ export const initRoutes = async (app: express.Application): Promise<void> => {
       check('username', 'Username is required').not().isEmpty(),
       check('password', 'Password is required').not().isEmpty(),
     ],
+    authAttemptRateLimiter,
     login,
   );
 
@@ -348,6 +462,7 @@ export const initRoutes = async (app: express.Application): Promise<void> => {
       check('username', 'Username is required').not().isEmpty(),
       check('password', 'Password must be at least 6 characters').isLength({ min: 6 }),
     ],
+    authRegistrationRateLimiter,
     register,
   );
 
@@ -371,9 +486,23 @@ export const initRoutes = async (app: express.Application): Promise<void> => {
   // Public configuration endpoint (no auth required to check skipAuth setting)
   app.get(`${config.basePath}/public-config`, getPublicConfig);
 
+  // Public marketplace discovery API (issue #809). Off by default; enable via
+  // systemConfig.discovery.enabled. When disabled, all of these return 404 to
+  // avoid leaking the catalog. Designed for external MCP clients (OpenClaw,
+  // Claude Desktop installers, etc.) to programmatically find servers in the
+  // local market without dashboard auth.
+  app.get('/.well-known/mcp-marketplace', getMarketplaceWellKnown);
+  app.get(`${config.basePath}/discovery/servers`, listDiscoveryServers);
+  app.get(`${config.basePath}/discovery/servers/:name`, getDiscoveryServer);
+  app.get(`${config.basePath}/discovery/servers/:name/install`, getDiscoveryServerInstall);
+  app.get(`${config.basePath}/discovery/categories`, listDiscoveryCategories);
+  app.get(`${config.basePath}/discovery/tags`, listDiscoveryTags);
+
   // OpenAPI generation endpoints
   app.get(`${config.basePath}/api/openapi.json`, getOpenAPISpec);
+  app.get(`${config.basePath}/api/openapi.yaml`, getOpenAPISpec);
   app.get(`${config.basePath}/api/:name/openapi.json`, getGroupOpenAPISpec);
+  app.get(`${config.basePath}/api/:name/openapi.yaml`, getGroupOpenAPISpec);
   app.get(`${config.basePath}/api/openapi/servers`, getOpenAPIServers);
   app.get(`${config.basePath}/api/openapi/stats`, getOpenAPIStats);
 
@@ -382,6 +511,11 @@ export const initRoutes = async (app: express.Application): Promise<void> => {
   app.post(`${config.basePath}/api/tools/:serverName/:toolName`, executeToolViaOpenAPI);
   app.get(`${config.basePath}/api/:name/tools/:serverName/:toolName`, executeToolViaOpenAPI);
   app.post(`${config.basePath}/api/:name/tools/:serverName/:toolName`, executeToolViaOpenAPI);
+
+  // Mounted last so the public routes registered on `router` above are matched
+  // before the shared authenticated-route rate limiter runs. See the comment on
+  // `authenticatedRouter.use(authenticatedRouteRateLimiter)`.
+  router.use(authenticatedRouter);
 
   app.use(`${config.basePath}/api`, router);
 };

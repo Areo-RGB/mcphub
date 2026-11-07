@@ -6,10 +6,8 @@ import { getAppDataSource } from '../connection.js';
  * Repository for Server entity
  */
 export class ServerRepository {
-  private repository: Repository<Server>;
-
-  constructor() {
-    this.repository = getAppDataSource().getRepository(Server);
+  private get repository(): Repository<Server> {
+    return getAppDataSource().getRepository(Server);
   }
 
   /**
@@ -75,9 +73,9 @@ export class ServerRepository {
   async findAllPaginated(page: number, limit: number): Promise<{ data: Server[]; total: number }> {
     const skip = (page - 1) * limit;
     const [data, total] = await this.repository.findAndCount({
-      order: { 
-        enabled: 'DESC',  // Enabled servers first
-        createdAt: 'ASC'  // Then by creation time
+      order: {
+        enabled: 'DESC', // Enabled servers first
+        createdAt: 'ASC', // Then by creation time
       },
       skip,
       take: limit,
@@ -89,17 +87,47 @@ export class ServerRepository {
   /**
    * Find servers by owner with pagination
    */
-  async findByOwnerPaginated(owner: string, page: number, limit: number): Promise<{ data: Server[]; total: number }> {
+  async findByOwnerPaginated(
+    owner: string,
+    page: number,
+    limit: number,
+  ): Promise<{ data: Server[]; total: number }> {
     const skip = (page - 1) * limit;
     const [data, total] = await this.repository.findAndCount({
       where: { owner },
-      order: { 
-        enabled: 'DESC',  // Enabled servers first
-        createdAt: 'ASC'  // Then by creation time
+      order: {
+        enabled: 'DESC', // Enabled servers first
+        createdAt: 'ASC', // Then by creation time
       },
       skip,
       take: limit,
     });
+
+    return { data, total };
+  }
+
+  /**
+   * Find servers visible to a non-admin user with pagination.
+   */
+  async findVisibleToUserPaginated(
+    username: string,
+    page: number,
+    limit: number,
+  ): Promise<{ data: Server[]; total: number }> {
+    const skip = (page - 1) * limit;
+    const [data, total] = await this.repository
+      .createQueryBuilder('server')
+      .where('server.owner = :username', { username })
+      .orWhere('server.visibility = :visibility', { visibility: 'public' })
+      .orWhere(
+        'server.visibility = :sharedVisibility AND :username = ANY(COALESCE(server.sharedWithUsers, ARRAY[]::text[]))',
+        { sharedVisibility: 'group', username },
+      )
+      .orderBy('server.enabled', 'DESC')
+      .addOrderBy('server.createdAt', 'ASC')
+      .skip(skip)
+      .take(limit)
+      .getManyAndCount();
 
     return { data, total };
   }

@@ -1,9 +1,18 @@
 import { getActivityDao, isActivityLoggingEnabled } from '../dao/DaoFactory.js';
 import { IActivity, ActivityStatus } from '../types/index.js';
-import {
-  safeStringify as safeJsonStringify,
-  sanitizeStringForLogging,
-} from '../utils/serialization.js';
+import { stringifyWithoutRedaction, sanitizeStringForLogging } from '../utils/serialization.js';
+import { getCachedSystemConfig } from '../utils/systemConfigCache.js';
+import { logger } from '../utils/logger.js';
+
+const PAYLOAD_OMITTED = JSON.stringify({
+  _omitted: true,
+  _reason: 'activityLog.storeToolPayload is disabled',
+});
+const CREDENTIAL_TEMPLATE_PAYLOAD_OMITTED = JSON.stringify({
+  _omitted: true,
+  _reason: 'activityLog payload storage is disabled by security policy',
+});
+const CREDENTIAL_TEMPLATE_ERROR = 'Credential-templated server tool call failed';
 
 /**
  * Service for logging tool call activities
@@ -41,9 +50,12 @@ export class ActivityLoggingService {
     input?: any;
     output?: any;
     group?: string;
+    username?: string;
     keyId?: string;
     keyName?: string;
+    sourceIp?: string;
     errorMessage?: string;
+    hasCredentialTemplate?: boolean;
   }): Promise<void> {
     if (!this.isEnabled()) {
       return;
@@ -55,36 +67,77 @@ export class ActivityLoggingService {
     }
 
     try {
+      // Personal credential calls are metadata-only because upstream responses can echo or
+      // transform secrets in ways field-level redaction cannot reliably detect.
+      const storePayload = this.shouldStoreToolPayload() && !params.hasCredentialTemplate;
+      const omittedPayload = params.hasCredentialTemplate
+        ? CREDENTIAL_TEMPLATE_PAYLOAD_OMITTED
+        : PAYLOAD_OMITTED;
+      const errorMessage = params.errorMessage
+        ? params.hasCredentialTemplate
+          ? CREDENTIAL_TEMPLATE_ERROR
+          : sanitizeStringForLogging(params.errorMessage)
+        : undefined;
       const activity: Omit<IActivity, 'id'> = {
         timestamp: new Date(),
         server: params.server,
         tool: params.tool,
         duration: params.duration,
         status: params.status,
-        input: params.input ? this.safeStringify(params.input) : undefined,
-        output: params.output ? this.safeStringify(params.output) : undefined,
+        input: this.serializePayload(params.input, storePayload, omittedPayload),
+        output: this.serializePayload(params.output, storePayload, omittedPayload),
         group: params.group,
+        username: params.username,
         keyId: params.keyId,
         keyName: params.keyName,
-        errorMessage: params.errorMessage
-          ? sanitizeStringForLogging(params.errorMessage)
-          : undefined,
+        sourceIp: params.sourceIp,
+        errorMessage,
       };
 
       await activityDao.create(activity);
     } catch (error) {
       // Don't let logging failures affect the main flow
-      console.error('Failed to log activity:', error);
+      logger.error('Failed to log activity:', error);
     }
   }
 
   /**
-   * Safely stringify an object, handling circular references
+   * Whether to persist full tool call payloads. Defaults to true; deployments
+   * that treat tool arguments as sensitive can opt out via system config.
+   */
+  private shouldStoreToolPayload(): boolean {
+    return getCachedSystemConfig()?.activityLog?.storeToolPayload !== false;
+  }
+
+  /**
+   * Serialize a tool call payload for storage.
+   *
+   * Payloads are stored verbatim (no field-level redaction): heuristic
+   * redaction corrupts the audit record on false positives and gives false
+   * assurance on false negatives, so the decision is whether to store at all.
+   */
+  private serializePayload(
+    payload: any,
+    storePayload: boolean,
+    omittedPayload: string,
+  ): string | undefined {
+    if (payload === undefined || payload === null) {
+      return undefined;
+    }
+    if (!storePayload) {
+      return omittedPayload;
+    }
+    return this.safeStringify(payload);
+  }
+
+  /**
+   * Stringify an object without redaction, handling circular references and
+   * capping the stored size.
    */
   private safeStringify(obj: any): string {
     try {
       // Limit the size of the stringified data
-      const str = safeJsonStringify(obj, 2);
+      const str = stringifyWithoutRedaction(obj, 2);
       // Limit to 100KB
       if (str.length > 100000) {
         return JSON.stringify({
@@ -94,7 +147,7 @@ export class ActivityLoggingService {
         });
       }
       return str;
-    } catch (error) {
+    } catch (_error) {
       return JSON.stringify({
         _error: 'Failed to stringify data',
         _type: typeof obj,

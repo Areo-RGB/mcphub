@@ -1,6 +1,8 @@
 import { Request, Response } from 'express';
 import { getActivityDao, isActivityLoggingEnabled } from '../dao/DaoFactory.js';
 import { IActivityFilter } from '../types/index.js';
+import { logger } from '../utils/logger.js';
+import { requireAdmin } from '../utils/requireAdmin.js';
 
 /**
  * Check if activity feature is available (database mode only)
@@ -18,6 +20,8 @@ export const checkActivityAvailable = async (req: Request, res: Response): Promi
  * Get paginated list of activities
  */
 export const getActivities = async (req: Request, res: Response): Promise<void> => {
+  if (!(await requireAdmin(req, res))) return;
+
   try {
     const activityDao = getActivityDao();
     if (!activityDao) {
@@ -63,6 +67,9 @@ export const getActivities = async (req: Request, res: Response): Promise<void> 
     if (req.query.group) {
       filter.group = req.query.group as string;
     }
+    if (req.query.username) {
+      filter.username = req.query.username as string;
+    }
     if (req.query.keyId) {
       filter.keyId = req.query.keyId as string;
     }
@@ -91,7 +98,7 @@ export const getActivities = async (req: Request, res: Response): Promise<void> 
       },
     });
   } catch (error) {
-    console.error('Error fetching activities:', error);
+    logger.error('Error fetching activities:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to fetch activities',
@@ -103,6 +110,8 @@ export const getActivities = async (req: Request, res: Response): Promise<void> 
  * Get activity by ID (for viewing full details including input/output)
  */
 export const getActivityById = async (req: Request, res: Response): Promise<void> => {
+  if (!(await requireAdmin(req, res))) return;
+
   try {
     const activityDao = getActivityDao();
     if (!activityDao) {
@@ -129,7 +138,7 @@ export const getActivityById = async (req: Request, res: Response): Promise<void
       data: activity,
     });
   } catch (error) {
-    console.error('Error fetching activity:', error);
+    logger.error('Error fetching activity:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to fetch activity',
@@ -141,6 +150,8 @@ export const getActivityById = async (req: Request, res: Response): Promise<void
  * Get activity statistics
  */
 export const getActivityStats = async (req: Request, res: Response): Promise<void> => {
+  if (!(await requireAdmin(req, res))) return;
+
   try {
     const activityDao = getActivityDao();
     if (!activityDao) {
@@ -165,6 +176,9 @@ export const getActivityStats = async (req: Request, res: Response): Promise<voi
     if (req.query.group) {
       filter.group = req.query.group as string;
     }
+    if (req.query.username) {
+      filter.username = req.query.username as string;
+    }
     if (req.query.keyId) {
       filter.keyId = req.query.keyId as string;
     }
@@ -185,7 +199,7 @@ export const getActivityStats = async (req: Request, res: Response): Promise<voi
       data: stats,
     });
   } catch (error) {
-    console.error('Error fetching activity stats:', error);
+    logger.error('Error fetching activity stats:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to fetch activity statistics',
@@ -197,6 +211,8 @@ export const getActivityStats = async (req: Request, res: Response): Promise<voi
  * Get distinct filter options (servers, tools, groups)
  */
 export const getActivityFilterOptions = async (req: Request, res: Response): Promise<void> => {
+  if (!(await requireAdmin(req, res))) return;
+
   try {
     const activityDao = getActivityDao();
     if (!activityDao) {
@@ -207,10 +223,11 @@ export const getActivityFilterOptions = async (req: Request, res: Response): Pro
       return;
     }
 
-    const [servers, tools, groups, keyNames] = await Promise.all([
+    const [servers, tools, groups, usernames, keyNames] = await Promise.all([
       activityDao.getDistinctServers(),
       activityDao.getDistinctTools(),
       activityDao.getDistinctGroups(),
+      activityDao.getDistinctUsernames(),
       activityDao.getDistinctKeyNames(),
     ]);
 
@@ -220,11 +237,12 @@ export const getActivityFilterOptions = async (req: Request, res: Response): Pro
         servers,
         tools,
         groups,
+        usernames,
         keyNames,
       },
     });
   } catch (error) {
-    console.error('Error fetching filter options:', error);
+    logger.error('Error fetching filter options:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to fetch filter options',
@@ -236,6 +254,8 @@ export const getActivityFilterOptions = async (req: Request, res: Response): Pro
  * Delete old activity records
  */
 export const deleteOldActivities = async (req: Request, res: Response): Promise<void> => {
+  if (!(await requireAdmin(req, res))) return;
+
   try {
     const activityDao = getActivityDao();
     if (!activityDao) {
@@ -270,7 +290,7 @@ export const deleteOldActivities = async (req: Request, res: Response): Promise<
       },
     });
   } catch (error) {
-    console.error('Error deleting old activities:', error);
+    logger.error('Error deleting old activities:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to delete old activities',

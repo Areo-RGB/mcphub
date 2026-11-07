@@ -1,3 +1,4 @@
+import type { CredentialSlot } from '../../types/index.js';
 import {
   Entity,
   Column,
@@ -44,6 +45,17 @@ export class Server {
   @Column({ type: 'varchar', length: 255, nullable: true })
   owner?: string;
 
+  // Per-server visibility for non-admin users.
+  //   'private' — only the owner (or admins) can see this server. Default.
+  //   'public'  — every authenticated user can see this server.
+  //   'group'   — explicitly selected users can see this server.
+  // See issues #817 and #1037.
+  @Column({ type: 'varchar', length: 16, default: 'private' })
+  visibility: 'private' | 'group' | 'public';
+
+  @Column({ type: 'text', array: true, nullable: true })
+  sharedWithUsers?: string[];
+
   @Column({ type: 'boolean', default: false })
   enableKeepAlive?: boolean;
 
@@ -73,6 +85,12 @@ export class Server {
 
   @Column({ type: 'simple-json', nullable: true })
   passthroughHeaders?: string[];
+
+  @Column({ type: 'boolean', nullable: true })
+  perSessionClient?: boolean;
+
+  @Column({ type: 'simple-json', nullable: true })
+  credentialTemplate?: CredentialSlot[];
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamp' })
   createdAt: Date;
